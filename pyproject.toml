@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-share"
+version = "0.1.0"
+description = "Domain-driven quota management and fair-sharing engine for a subscription shared by a trusted group."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Claude Share Contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+claude-share = "claude_share.cli.main:main"
+claude-share-hook = "claude_share.integrations.claude_code.hook:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_share"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
