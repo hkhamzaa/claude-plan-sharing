@@ -1,0 +1,15 @@
+{
+  "name": "claude-share-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/app.ts --bundle --outdir=dist --format=esm --target=es2022 && node scripts/copy-static.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

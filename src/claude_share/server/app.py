@@ -15,9 +15,11 @@ for actually running this as a deployed service.
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from psycopg.errors import DeadlockDetected
 
 from claude_share.application.agent_service import AgentService
@@ -61,5 +63,13 @@ def create_app(uow_factory: Callable[[], UnitOfWork]) -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, bool]:
         return {"ok": True}
+
+    dashboard_dist = Path(__file__).resolve().parents[3] / "dashboard" / "dist"
+    if dashboard_dist.is_dir():
+        app.mount(
+            "/dashboard",
+            StaticFiles(directory=dashboard_dist, html=True),
+            name="dashboard",
+        )
 
     return app

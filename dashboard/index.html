@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Share Dashboard</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Claude Share</h1>
+      <p class="tagline">Read-only pool dashboard over the Milestone 5 API</p>
+    </header>
+
+    <p id="global-status" class="status" aria-live="polite"></p>
+
+    <section id="setup-panel">
+      <h2>Configure access</h2>
+      <p class="hint">
+        Uses the same device bearer token as the browser extension. When served from the central
+        server at <code>/dashboard/</code>, leave Server URL blank to use this host.
+      </p>
+      <label>
+        Server URL (optional if same origin)
+        <input id="server-url" type="url" placeholder="https://your-server.example.com" />
+      </label>
+      <label>
+        Device token
+        <input id="device-token" type="password" autocomplete="off" />
+      </label>
+      <label>
+        Member ID
+        <input id="member-id" type="text" />
+      </label>
+      <button id="save-config" type="button">Save &amp; open dashboard</button>
+
+      <h3>Register a device</h3>
+      <label>
+        User ID
+        <input id="user-id" type="text" />
+      </label>
+      <label>
+        Device name
+        <input id="device-name" type="text" placeholder="Dashboard" />
+      </label>
+      <button id="register-device" type="button">Register via POST /devices</button>
+    </section>
+
+    <section id="app-panel" class="hidden">
+      <nav class="tabs">
+        <button type="button" data-view="my-status" class="active">My status</button>
+        <button type="button" data-view="pool">Pool overview</button>
+        <button type="button" data-view="pending">Pending requests</button>
+        <button type="button" data-view="grants">Active grants</button>
+        <button id="refresh-now" type="button" class="secondary">Refresh</button>
+        <button id="logout" type="button" class="secondary">Clear saved token</button>
+      </nav>
+
+      <div id="view-my-status" class="view"></div>
+      <div id="view-pool" class="view hidden"></div>
+      <div id="view-pending" class="view hidden"></div>
+      <div id="view-grants" class="view hidden"></div>
+    </section>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

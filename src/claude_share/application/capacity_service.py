@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from claude_share.application.capacity_queries import member_grant_summary
+from claude_share.application.capacity_queries import active_grants_as_of, member_grant_summary
 from claude_share.application.dto import EffectiveCapacity
 from claude_share.application.ids import new_id
 from claude_share.domain.capacity import compute_guaranteed_units, compute_potential_units
@@ -230,6 +230,40 @@ class CapacityService:
             uow.commit()
 
         return revoked_grant
+
+    def list_pending_requests_for_target(self, member_id: str) -> list[CapacityRequest]:
+        """Pending capacity requests awaiting this member's approval."""
+        with self._uow_factory() as uow:
+            member = uow.members.get(member_id)
+            if member is None:
+                uow.rollback()
+                raise MemberNotFoundError(member_id)
+            requests = uow.requests.list_pending_by_target(member_id)
+            uow.commit()
+        return requests
+
+    def list_active_grants(self, member_id: str) -> tuple[list[CapacityGrant], list[CapacityGrant]]:
+        """Active grants this member has sent (as source) and received (as recipient)."""
+        now = datetime.now(timezone.utc)
+        sent: list[CapacityGrant] = []
+        received: list[CapacityGrant] = []
+
+        with self._uow_factory() as uow:
+            member = uow.members.get(member_id)
+            if member is None:
+                uow.rollback()
+                raise MemberNotFoundError(member_id)
+
+            for window_type in WindowType:
+                sent.extend(
+                    active_grants_as_of(uow, uow.grants.list_by_source(member_id, window_type), now)
+                )
+                received.extend(
+                    active_grants_as_of(uow, uow.grants.list_by_recipient(member_id, window_type), now)
+                )
+            uow.commit()
+
+        return sent, received
 
     def get_effective_capacity(self, member_id: str, window_type: WindowType) -> EffectiveCapacity:
         """Grant-aware view of a member's capacity: base, guaranteed, and

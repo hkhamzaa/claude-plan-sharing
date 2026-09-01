@@ -104,6 +104,9 @@ class CapacityRequestRepository(ABC):
     @abstractmethod
     def update(self, request: CapacityRequest) -> None: ...
 
+    @abstractmethod
+    def list_pending_by_target(self, target_member_id: str) -> list[CapacityRequest]: ...
+
 
 class CapacityGrantRepository(ABC):
     @abstractmethod

@@ -206,6 +206,11 @@ class DeviceRegisteredOut(BaseModel):
     token: str
 
 
+class MemberGrantsOut(BaseModel):
+    sent: list[CapacityGrantOut]
+    received: list[CapacityGrantOut]
+
+
 # --- dataclass -> schema converters ------------------------------------------
 
 

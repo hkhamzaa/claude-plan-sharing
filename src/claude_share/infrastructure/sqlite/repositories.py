@@ -340,6 +340,19 @@ class SqliteCapacityRequestRepository(CapacityRequestRepository):
         if cursor.rowcount == 0:
             raise ValueError(f"No capacity_requests row with id={request.id!r} to update")
 
+    def list_pending_by_target(self, target_member_id: str) -> list[CapacityRequest]:
+        rows = self._conn.execute(
+            """
+            SELECT id, pool_id, requester_member_id, target_member_id, window_type,
+                   amount, type, status, created_at, approved_at, expires_at, message
+            FROM capacity_requests
+            WHERE target_member_id = ? AND status = ?
+            ORDER BY created_at
+            """,
+            (target_member_id, RequestStatus.PENDING.value),
+        ).fetchall()
+        return [_row_to_request(row) for row in rows]
+
 
 def _row_to_request(row: tuple) -> CapacityRequest:
     return CapacityRequest(

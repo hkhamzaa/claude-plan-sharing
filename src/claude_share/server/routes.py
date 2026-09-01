@@ -60,6 +60,7 @@ from claude_share.server.schemas import (
     DeviceRegisteredOut,
     EffectiveCapacityOut,
     MemberOut,
+    MemberGrantsOut,
     MemberStatusOut,
     QuotaCheckResultOut,
     RegisterDeviceRequest,
@@ -230,6 +231,37 @@ def get_effective_capacity(
     require_member(uow_factory, device, member_id)
     capacity = capacity_service.get_effective_capacity(member_id, window)
     return effective_capacity_out(capacity)
+
+
+@router.get("/members/{member_id}/capacity/requests/pending", response_model=list[CapacityRequestOut])
+def list_pending_capacity_requests(
+    member_id: str,
+    device: Device = Depends(get_current_device),
+    uow_factory: Callable[[], UnitOfWork] = Depends(get_uow_factory),
+    capacity_service: CapacityService = Depends(get_capacity_service),
+) -> list[CapacityRequestOut]:
+    """Read-only list of PENDING requests where `member_id` is the target
+    (incoming approvals). Added in Milestone 7 for the dashboard."""
+    require_member(uow_factory, device, member_id)
+    requests = capacity_service.list_pending_requests_for_target(member_id)
+    return [capacity_request_out(r) for r in requests]
+
+
+@router.get("/members/{member_id}/capacity/grants", response_model=MemberGrantsOut)
+def list_active_capacity_grants(
+    member_id: str,
+    device: Device = Depends(get_current_device),
+    uow_factory: Callable[[], UnitOfWork] = Depends(get_uow_factory),
+    capacity_service: CapacityService = Depends(get_capacity_service),
+) -> MemberGrantsOut:
+    """Read-only list of ACTIVE grants sent and received by this member.
+    Added in Milestone 7 for the dashboard."""
+    require_member(uow_factory, device, member_id)
+    sent, received = capacity_service.list_active_grants(member_id)
+    return MemberGrantsOut(
+        sent=[capacity_grant_out(g) for g in sent],
+        received=[capacity_grant_out(g) for g in received],
+    )
 
 
 # --- devices / agent identity ------------------------------------------------

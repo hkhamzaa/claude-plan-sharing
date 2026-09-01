@@ -1141,3 +1141,58 @@ support, no new server business logic, no real Anthropic account integration,
 no Desktop/Cowork integration, no dashboard beyond the extension's own popup/
 indicator UI, and no hard blocking beyond best-effort send interception as
 scoped above.
+
+---
+
+## Milestone 7 — Dashboard (read-only web UI)
+
+### Thin client over the Milestone 5 API
+
+The dashboard (`dashboard/`) is a static single-page app served by the
+FastAPI app at `/dashboard/` when `dashboard/dist/` exists (see
+`server/app.py`). It displays pool/member quota state and exposes
+approve/reject/revoke actions, but **implements no quota or capacity
+business logic** — every figure is read from an existing API field, and
+every mutation calls an existing Milestone 5 endpoint.
+
+Authentication matches the extension: a device bearer token and `member_id`
+stored in `localStorage`, sent as `Authorization: Bearer ...` on each
+request. When served from the same origin as the API, the setup form can
+leave Server URL blank (relative fetches).
+
+Polling refreshes views every 60 seconds (no websockets), consistent with
+the browser extension.
+
+### New read endpoints (Milestone 7 only additions)
+
+Milestone 2/5 never exposed HTTP list endpoints for pending requests or
+active grants. The dashboard needed two minimal read-only additions:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /members/{member_id}/capacity/requests/pending` | PENDING requests where this member is the target (incoming approvals) |
+| `GET /members/{member_id}/capacity/grants` | ACTIVE grants sent and received (`{ sent, received }`) |
+
+Both require bearer auth and `require_member()` for the path `member_id`.
+Implementation is thin repository reads plus existing
+`active_grants_as_of()` for grant expiration — no new business rules.
+
+Repository port added: `CapacityRequestRepository.list_pending_by_target()`.
+Application methods: `CapacityService.list_pending_requests_for_target()`
+and `list_active_grants()`.
+
+### Pool overview fan-out
+
+The pool overview view calls `GET /pools/{pool_id}/members` once, then
+for each member `GET /members/{id}/status` plus `GET /members/{id}/capacity`
+for both window types — **5 HTTP calls per member** after the initial list.
+For the small trusted pools this project targets, that is acceptable; a
+future `GET /pools/{id}/overview` batch endpoint would reduce round-trips
+but would require new aggregation logic and was intentionally deferred.
+
+### Deliberately out of scope for Milestone 7
+
+Per the milestone brief: no websockets, no request-creation UI (CLI
+remains the primary way to open new SOLID/SHARED requests), no multi-pool
+admin, no new auth mechanism, no duplicated quota math on the client.
+See `dashboard/README.md` for build/serve/configure instructions.

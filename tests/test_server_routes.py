@@ -421,3 +421,89 @@ def test_list_devices_for_another_user_is_forbidden(client: TestClient, pool_and
     bob = pool_and_tokens["bob"]
     r = client.get(f"/users/{bob['user_id']}/devices", headers=_auth(pool_and_tokens["alice_token"]))
     assert r.status_code == 403
+
+
+# --- Milestone 7 dashboard read endpoints ------------------------------------
+
+
+def test_list_pending_requests_requires_auth(client: TestClient, pool_and_tokens: dict) -> None:
+    alice = pool_and_tokens["alice"]
+    r = client.get(f"/members/{alice['id']}/capacity/requests/pending")
+    assert r.status_code == 401
+
+
+def test_list_pending_requests_only_incoming_for_target(client: TestClient, pool_and_tokens: dict) -> None:
+    pool_id = pool_and_tokens["pool_id"]
+    alice, bob = pool_and_tokens["alice"], pool_and_tokens["bob"]
+    alice_headers = _auth(pool_and_tokens["alice_token"])
+    bob_headers = _auth(pool_and_tokens["bob_token"])
+
+    r = client.post(
+        "/capacity/requests",
+        json={
+            "pool_id": pool_id,
+            "requester_member_id": bob["id"],
+            "target_member_id": alice["id"],
+            "window_type": "five_hour",
+            "amount": 100,
+            "type": "solid",
+        },
+        headers=bob_headers,
+    )
+    assert r.status_code == 201, r.text
+    request_id = r.json()["id"]
+
+    r = client.get(f"/members/{alice['id']}/capacity/requests/pending", headers=alice_headers)
+    assert r.status_code == 200
+    assert len(r.json()) == 1
+    assert r.json()[0]["id"] == request_id
+    assert r.json()[0]["target_member_id"] == alice["id"]
+
+    r = client.get(f"/members/{bob['id']}/capacity/requests/pending", headers=bob_headers)
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_list_pending_requests_for_other_member_is_forbidden(client: TestClient, pool_and_tokens: dict) -> None:
+    bob = pool_and_tokens["bob"]
+    r = client.get(
+        f"/members/{bob['id']}/capacity/requests/pending",
+        headers=_auth(pool_and_tokens["alice_token"]),
+    )
+    assert r.status_code == 403
+
+
+def test_list_active_grants_after_approval(client: TestClient, pool_and_tokens: dict) -> None:
+    pool_id = pool_and_tokens["pool_id"]
+    alice, bob = pool_and_tokens["alice"], pool_and_tokens["bob"]
+    alice_headers = _auth(pool_and_tokens["alice_token"])
+    bob_headers = _auth(pool_and_tokens["bob_token"])
+
+    r = client.post(
+        "/capacity/requests",
+        json={
+            "pool_id": pool_id,
+            "requester_member_id": bob["id"],
+            "target_member_id": alice["id"],
+            "window_type": "five_hour",
+            "amount": 150,
+            "type": "shared",
+        },
+        headers=bob_headers,
+    )
+    request_id = r.json()["id"]
+    client.post(
+        f"/capacity/requests/{request_id}/approve",
+        json={"approving_member_id": alice["id"]},
+        headers=alice_headers,
+    )
+
+    r = client.get(f"/members/{alice['id']}/capacity/grants", headers=alice_headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["sent"]) == 1
+    assert body["sent"][0]["amount"] == 150
+
+    r = client.get(f"/members/{bob['id']}/capacity/grants", headers=bob_headers)
+    assert r.status_code == 200
+    assert len(r.json()["received"]) == 1
