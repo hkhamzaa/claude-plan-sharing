@@ -1,0 +1,18 @@
+{
+  "name": "claude-share-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Share browser extension for claude.ai quota visibility (Milestone 6)",
+  "scripts": {
+    "build": "esbuild src/background.ts src/content.ts src/popup/popup.ts --bundle --outdir=dist --format=esm --target=chrome114",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "esbuild": "^0.25.0",
+    "jsdom": "^26.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

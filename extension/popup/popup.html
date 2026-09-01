@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Claude Share</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Claude Share</h1>
+      <p class="notice">
+        Requires a running Milestone 5 central server. Best-effort quota visibility only —
+        not a hard security boundary.
+      </p>
+
+      <section>
+        <h2>Connection</h2>
+        <label>
+          Server URL
+          <input id="server-url" type="url" placeholder="https://your-server.example.com" />
+        </label>
+        <label>
+          Device token
+          <input id="device-token" type="password" autocomplete="off" placeholder="Bearer token from POST /devices" />
+        </label>
+        <label>
+          Member ID
+          <input id="member-id" type="text" placeholder="Your pool member UUID" />
+        </label>
+        <button id="save-config" type="button">Save configuration</button>
+        <p id="save-status" class="status" aria-live="polite"></p>
+      </section>
+
+      <section>
+        <h2>Register a device</h2>
+        <p class="hint">Uses the same <code>POST /devices</code> flow as the CLI — no separate auth mechanism.</p>
+        <label>
+          User ID
+          <input id="user-id" type="text" placeholder="From pool create output" />
+        </label>
+        <label>
+          Device name
+          <input id="device-name" type="text" placeholder="Browser extension" />
+        </label>
+        <button id="register-device" type="button">Register device</button>
+        <p id="register-status" class="status" aria-live="polite"></p>
+      </section>
+
+      <section>
+        <h2>Current status</h2>
+        <button id="refresh-status" type="button">Refresh now</button>
+        <pre id="status-output">Not configured yet.</pre>
+      </section>
+    </main>
+    <script type="module" src="../dist/popup/popup.js"></script>
+  </body>
+</html>

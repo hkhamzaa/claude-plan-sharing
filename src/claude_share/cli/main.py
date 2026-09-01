@@ -47,6 +47,7 @@ from pathlib import Path
 from claude_share.agent import commands as agent_commands
 from claude_share.agent.errors import AgentError
 from claude_share.agent.identity import DEFAULT_CONFIG_PATH, LocalIdentity, load_local_identity
+from claude_share.agent.remote_client import RemoteQuotaService, build_remote_services
 from claude_share.application.capacity_service import CapacityService
 from claude_share.application.dto import MemberStatus, WindowStatus
 from claude_share.application.quota_service import QuotaService
@@ -112,6 +113,16 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Path to the local identity config file (default: %(default)s, or $CLAUDE_SHARE_CONFIG)"
         % {"default": str(DEFAULT_CONFIG_PATH)},
+    )
+    parser.add_argument(
+        "--server",
+        dest="server",
+        default=None,
+        help="Central server base URL (Milestone 5), e.g. https://claude-share.example.com. "
+        "Only consulted by `login` (register against this server instead of going local) and "
+        "`pool create` (create the pool there instead of locally); every other command instead "
+        "uses whichever server this machine already `login`-ed against, if any (--db/--config's "
+        "local-SQLite path is used otherwise, exactly as in Milestones 1-4).",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -268,7 +279,11 @@ def _cmd_pool_create(service: QuotaService, args: argparse.Namespace) -> int:
         return 1
 
     pool = service.create_pool(args.name, member_names)
-    members = service.list_members(pool.id)
+    if isinstance(service, RemoteQuotaService):
+        assert service.last_created_members is not None
+        members = service.last_created_members
+    else:
+        members = service.list_members(pool.id)
 
     print(f"Created pool {pool.id!r} ({pool.name!r}) with {pool.member_count} member(s):")
     for member in members:
@@ -429,19 +444,36 @@ def _cmd_capacity(service: CapacityService, args: argparse.Namespace, identity: 
     return 0
 
 
-def _cmd_login(config_path: Path, uow_factory, args: argparse.Namespace) -> int:
-    identity = agent_commands.login(config_path, uow_factory, args.user_id, args.device_name)
-    print(
-        f"Logged in as user_id={identity.user_id!r} on device {identity.device_name!r} "
-        f"(device_id={identity.device_id!r})."
-    )
+def _cmd_login(config_path: Path, db_path: Path, uow_factory, args: argparse.Namespace) -> int:
+    if args.server:
+        identity = agent_commands.login_remote(config_path, args.server, args.user_id, args.device_name)
+        print(
+            f"Logged in as user_id={identity.user_id!r} on device {identity.device_name!r} "
+            f"(device_id={identity.device_id!r}) against server {identity.server_url!r}."
+        )
+    else:
+        init_db(db_path)
+        identity = agent_commands.login(config_path, uow_factory, args.user_id, args.device_name)
+        print(
+            f"Logged in as user_id={identity.user_id!r} on device {identity.device_name!r} "
+            f"(device_id={identity.device_id!r})."
+        )
     print("Run `claude-share join --pool <pool_id> --member <member_id>` next to select a pool/member.")
     return 0
 
 
-def _cmd_join(config_path: Path, uow_factory, args: argparse.Namespace) -> int:
-    identity = agent_commands.join_pool(config_path, uow_factory, args.pool_id, args.member_id)
-    print(f"Joined pool {identity.pool_id!r} as member {identity.member_id!r}.")
+def _cmd_join(
+    config_path: Path,
+    uow_factory,
+    args: argparse.Namespace,
+    identity: LocalIdentity | None,
+    quota_service: QuotaService,
+) -> int:
+    if identity is not None and identity.is_remote:
+        new_identity = agent_commands.join_pool_remote(config_path, quota_service, args.pool_id, args.member_id)
+    else:
+        new_identity = agent_commands.join_pool(config_path, uow_factory, args.pool_id, args.member_id)
+    print(f"Joined pool {new_identity.pool_id!r} as member {new_identity.member_id!r}.")
     return 0
 
 
@@ -507,6 +539,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     db_path = _resolve_db_path(args.db)
     config_path = _resolve_config_path(args.config)
+    uow_factory = lambda: SqliteUnitOfWork(db_path)
 
     try:
         if args.command == "hook" and args.hook_command == "install":
@@ -514,18 +547,39 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "hook" and args.hook_command == "uninstall":
             return _cmd_hook_uninstall(args)
 
-        quota_service, capacity_service = _build_services(db_path)
-        uow_factory = lambda: SqliteUnitOfWork(db_path)
-
         if args.command == "login":
-            return _cmd_login(config_path, uow_factory, args)
-        if args.command == "join":
-            return _cmd_join(config_path, uow_factory, args)
-        if args.command == "whoami":
-            return _cmd_whoami(config_path, quota_service, capacity_service)
+            return _cmd_login(config_path, db_path, uow_factory, args)
 
         identity = load_local_identity(config_path)
 
+        # `pool create --server <url>` is a bootstrap operation (Milestone
+        # 5): it can target an arbitrary server even with no local identity
+        # configured yet, or a different one already configured - mirrors
+        # the server's own no-auth exception for pool creation (see
+        # server/auth.py). Explicit --server always wins here, exactly
+        # like every other "explicit arg beats local identity" rule.
+        if args.command == "pool" and args.pool_command == "create" and args.server:
+            remote_quota_service, _remote_capacity_service, _remote_agent_service = build_remote_services(
+                args.server, device_token=None
+            )
+            return _cmd_pool_create(remote_quota_service, args)
+
+        # Milestone 5: an identity that `login`-ed against a central server
+        # talks HTTP via Remote*Service instances instead of local SQLite
+        # for every command from here on - see agent/remote_client.py. A
+        # purely local identity (or none at all) is completely unchanged
+        # from Milestones 1-4.
+        if identity is not None and identity.is_remote:
+            quota_service, capacity_service, _agent_service = build_remote_services(
+                identity.server_url, identity.device_token
+            )
+        else:
+            quota_service, capacity_service = _build_services(db_path)
+
+        if args.command == "join":
+            return _cmd_join(config_path, uow_factory, args, identity, quota_service)
+        if args.command == "whoami":
+            return _cmd_whoami(config_path, quota_service, capacity_service)
         if args.command == "pool" and args.pool_command == "create":
             return _cmd_pool_create(quota_service, args)
         if args.command == "status":

@@ -3,7 +3,7 @@
 A quota-management and fair-sharing system for a trusted group of people who
 share one underlying Claude subscription.
 
-**Milestones 1-4 are implemented.** Milestone 1 is the local quota
+**Milestones 1-5 are implemented.** Milestone 1 is the local quota
 engine: it divides 100% of a pool's logical quota equally among its
 members and tracks consumption against two independent windows (a
 five-hour window and a weekly window), backed by SQLite. Milestone 2 adds
@@ -14,10 +14,16 @@ served first). Milestone 3 adds a local identity layer (`login`/`join`)
 so a machine can be pointed at a pool/member once instead of retyping
 `--member`/`--pool` on every command. Milestone 4 adds an actual Claude
 Code integration: a `UserPromptSubmit` hook that checks quota before each
-prompt and blocks/warns accordingly, installed via `hook install`. There
-is still no real authentication and no networking/central server — see
+prompt and blocks/warns accordingly, installed via `hook install`.
+Milestone 5 adds an **optional** central server (FastAPI + PostgreSQL) so
+several devices can share one authoritative copy of this same state over
+HTTP, with per-device bearer-token authentication — see "Central server
+(Milestone 5)" below. **Local-only usage (Milestones 1-4) still works
+exactly as before, with zero server/Postgres setup** — the server is a new
+deployment *option*, not a replacement. See
 [docs/architecture.md](docs/architecture.md) for what's in scope and
-what's intentionally deferred.
+what's intentionally deferred, including the Postgres locking strategy and
+why the device-token auth is intentionally minimal.
 
 The quota engine only understands abstract "quota units" — it has no
 knowledge of tokens, prompts, or dollars. Claude-specific logic will live in
@@ -43,6 +49,16 @@ python -m venv .venv
 # Windows: .venv\Scripts\activate | macOS/Linux: source .venv/bin/activate
 pip install -e ".[dev]"
 ```
+
+`pip install -e .` alone (no extras) is all pure-local usage (Milestones
+1-4: `pool create`, `status`, `consume`, `request`/`grant`, the Claude
+Code hook) needs — it has zero third-party dependencies. The Milestone 5
+pieces are opt-in extras:
+
+- `.[postgres]` — just the Postgres-backed `UnitOfWork` (`psycopg`)
+- `.[server]` — the FastAPI central server (`.[postgres]` + `fastapi` + `uvicorn` + `pydantic`)
+- `.[client]` — the local agent's remote/HTTP mode (`httpx`)
+- `.[dev]` — everything above, plus `pytest`, for running the full test suite
 
 ## CLI usage
 
@@ -250,6 +266,95 @@ VS Code's Claude Code extension, which uses the same hook mechanism) is
 checked against Alice's guaranteed quota automatically - no per-prompt
 action needed.
 
+## Central server (Milestone 5)
+
+**Purely local usage needs none of this.** The server exists so multiple
+devices can share one authoritative copy of pool/quota/capacity state over
+HTTP instead of each keeping an independent local SQLite database.
+
+> **Run this behind TLS for any real deployment.** Bearer tokens and quota
+> data are sent as plain HTTP request/response bodies; over anything but a
+> fully private network path, that's as sniffable as a plaintext password.
+> `claude-share-server` does **not** terminate TLS itself — put a reverse
+> proxy (nginx, Caddy, an ALB, a managed ingress, ...) in front of it. See
+> [docs/architecture.md](docs/architecture.md) for the full reasoning.
+
+### 1. Set up Postgres
+
+Any reachable PostgreSQL 13+ server works. Create an empty database for
+claude-share to use:
+
+```bash
+createdb claude_share
+# or: psql -c "CREATE DATABASE claude_share;"
+```
+
+### 2. Run the server
+
+```bash
+pip install -e ".[server]"
+
+export CLAUDE_SHARE_DATABASE_URL="postgresql://user:password@localhost:5432/claude_share"
+export CLAUDE_SHARE_SERVER_HOST="0.0.0.0"   # default: 127.0.0.1
+export CLAUDE_SHARE_SERVER_PORT="8000"      # default: 8000
+
+claude-share-server
+```
+
+This creates the Postgres schema if it doesn't already exist (safe to run
+repeatedly) and starts a FastAPI app under `uvicorn`. Interactive API docs
+are available at `/docs` while it's running.
+
+### 3. Point a device at it
+
+`pool create` can bootstrap a pool directly on a server, before anyone has
+an identity yet — `--server` is a global flag (like `--db`/`--config`) and
+must come before the subcommand:
+
+```bash
+claude-share --server https://claude-share.example.com \
+    pool create --name "Family Plan" --members "Alice,Bob"
+# -> Alice: member_id=... user_id=...
+# -> Bob:   member_id=... user_id=...
+```
+
+`login --server <url>` registers this machine as a new device against
+that server (minting a bearer token, stored in the local identity config
+file — see `--config` above) instead of the local SQLite database. From
+`join` onward, every command works exactly like the local flow — same
+subcommands, same flags, same output shapes — just talking HTTP instead of
+opening a local database file:
+
+```bash
+claude-share --config alice.json login --server https://claude-share.example.com \
+    --user-id <alice_user_id> --device-name "Alice's Laptop"
+claude-share --config alice.json join --pool <pool_id> --member <alice_member_id>
+
+claude-share --config alice.json status
+claude-share --config alice.json consume --window five_hour --amount 10 --idempotency-key req-001
+claude-share --config alice.json request --from <bob_member_id> --window five_hour --amount 500 --type shared
+claude-share --config alice.json capacity --window five_hour
+```
+
+A machine that has never run `login --server` is completely unaffected —
+`--db`/`--config` with no `--server` behaves exactly as in Milestones 1-4,
+using local SQLite with zero server involvement. A machine can be pointed
+at local SQLite *or* a server, never both at once, per `--config` file
+(one `LocalIdentity` = one mode) — use separate `--config` paths to run
+both modes side by side on the same machine.
+
+### Auth model, briefly
+
+Every request except pool creation, device registration, and reading a
+pool's member list must carry a valid `Authorization: Bearer <token>` from
+a prior `login --server`/device registration; the server always resolves
+that token back to the device's own `user_id` and rejects any attempt to
+act as a `member_id` that `user_id` doesn't own (403), regardless of what
+the request body claims. This is intentionally minimal (an opaque, hashed,
+per-device token — no OAuth/JWT/expiry/scopes) for a small, cooperative,
+already-trusted group; see docs/architecture.md for the full design and
+why it's sufficient here.
+
 ## Running tests
 
 ```bash
@@ -257,25 +362,50 @@ pip install -e ".[dev]"
 pytest
 ```
 
+The Milestone 5 Postgres/server tests
+(`tests/test_postgres_unit_of_work.py`, `tests/test_server_e2e_postgres.py`)
+need a reachable Postgres server able to `CREATE`/`DROP DATABASE` — they
+default to `postgresql://postgres:postgres@localhost:5432/postgres` and
+create/drop their own short-lived throwaway databases per test run. Point
+them elsewhere with:
+
+```bash
+export CLAUDE_SHARE_TEST_POSTGRES_ADMIN_DSN="postgresql://user:password@host:5432/postgres"
+pytest
+```
+
+If no Postgres is reachable at that DSN, those two files are skipped (with
+a message naming the DSN they tried) and the rest of the suite — including
+`tests/test_server_routes.py`'s much larger set of HTTP-layer tests, which
+run against SQLite and need no external service — runs normally.
+
 ## Project layout
 
 ```
 src/claude_share/
   domain/          entities, value objects, allocation/capacity math, repository ports
   application/     use-case orchestration (QuotaService, CapacityService, AgentService) + DTOs
-  infrastructure/  SQLite implementation of the repository ports
+                   tokens.py: device API token generation/hashing (Milestone 5)
+  infrastructure/
+    sqlite/        SQLite implementation of the repository ports (local-only mode)
+    postgres/      Postgres implementation of the same ports (Milestone 5, central server mode)
   agent/           local identity/session layer: config file + login/join/status logic
+                   remote_client.py: HTTP counterpart to QuotaService/CapacityService/AgentService (Milestone 5)
   integrations/
     claude_code/   UserPromptSubmit hook (hook.py) + settings.json installer (settings.py)
+  server/          Milestone 5: FastAPI app exposing the application services over HTTP
   cli/             argparse CLI, translates args <-> service/agent/integrations calls
+                   (picks local-SQLite or remote-HTTP services per the loaded identity)
 tests/
 docs/architecture.md   layering rationale and documented assumptions
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full design
-rationale, including why the domain layer has zero SQLite or Claude
+rationale, including why the domain layer has zero SQLite/Postgres/Claude
 dependencies, the SOLID/SHARED accounting and owner-priority mechanics,
 the local identity config file's format/location, why `login` isn't real
-authentication yet, the verified `UserPromptSubmit` hook mechanism and
-its fail-open error policy, and every explicit assumption made along the
+authentication in local-only mode, the verified `UserPromptSubmit` hook
+mechanism and its fail-open error policy, the Postgres locking/isolation
+strategy and why it preserves Milestone 1's concurrency guarantees, the
+device-token auth design, and every explicit assumption made along the
 way.

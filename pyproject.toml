@@ -13,11 +13,19 @@ authors = [{ name = "Claude Share Contributors" }]
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# Postgres-backed UnitOfWork (infrastructure/postgres/) - only needed to run
+# claude-share against a central server instead of local SQLite.
+postgres = ["psycopg[binary]>=3.1"]
+# The FastAPI central server itself (server/).
+server = ["claude-share[postgres]", "fastapi>=0.111", "uvicorn>=0.30", "pydantic>=2.7"]
+# The local agent's remote (server-connected) HTTP client mode (agent/remote_client.py).
+client = ["httpx>=0.27"]
+dev = ["pytest>=8.0", "claude-share[server]", "claude-share[client]"]
 
 [project.scripts]
 claude-share = "claude_share.cli.main:main"
 claude-share-hook = "claude_share.integrations.claude_code.hook:main"
+claude-share-server = "claude_share.server.main:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_share"]

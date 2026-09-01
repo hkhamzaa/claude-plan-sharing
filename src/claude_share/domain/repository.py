@@ -57,6 +57,12 @@ class DeviceRepository(ABC):
     @abstractmethod
     def list_by_user(self, user_id: str) -> list[Device]: ...
 
+    @abstractmethod
+    def find_by_token_hash(self, token_hash: str) -> Device | None:
+        """Resolve a hashed bearer token back to the Device it belongs to
+        (Milestone 5 server auth). Returns None for an unknown hash."""
+        ...
+
 
 class AllocationRepository(ABC):
     @abstractmethod

@@ -240,12 +240,22 @@ class Device:
     member_id, which already resolves to one shared quota ledger - this
     model just makes that identity explicit and persistent instead of
     requiring member_id to be passed on every call.
+
+    `token_hash` (Milestone 5) is the only credential ever persisted for
+    this device - a SHA-256 digest of an opaque bearer token minted once at
+    registration. `token` carries the corresponding *plaintext* token, but
+    only transiently: it is populated on the object `AgentService.register_device()`
+    returns right after creation, is never written to storage, and is
+    always `None` on a `Device` loaded back via `get()`/`list_by_user()`.
+    See docs/architecture.md ("Milestone 5 - device auth tokens").
     """
 
     id: str
     user_id: str
     device_name: str
     created_at: datetime
+    token_hash: str
+    token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

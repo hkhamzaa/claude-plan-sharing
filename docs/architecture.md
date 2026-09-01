@@ -761,3 +761,383 @@ the same Claude Code hook mechanism, so Milestone 3's identity resolution
 already covers it without any special-casing), no browser extension, no
 central server/networking, no Desktop/Cowork integration, no
 notifications beyond the stdout warning / stderr block message.
+
+---
+
+## Milestone 5 — Central Server (multi-device coordination)
+
+### What problem this solves, and what stays exactly the same
+
+Before this milestone, every local SQLite database was authoritative only
+for the one machine it lived on - two devices logged in as the same
+`user_id` never actually shared state unless they pointed at the literal
+same database file. Milestone 5 adds a central server so that
+`Pool`/`Member`/`Allocation`/`QuotaWindow`/`UsageRecord`/
+`CapacityRequest`/`CapacityGrant`/`SharedConsumptionRecord` state can live
+in one place (PostgreSQL) that every device talks to over HTTP.
+
+Nothing about the domain/application logic changed to make this possible,
+by design: `QuotaService`, `CapacityService`, and `AgentService` are the
+exact same classes, calling the exact same `UnitOfWork`/repository ports,
+that Milestones 1-4 already had. This milestone only (1) adds a second
+`UnitOfWork` implementation (`infrastructure/postgres/`) those services can
+be pointed at instead of `SqliteUnitOfWork`, (2) adds an HTTP layer
+(`server/`) in front of the same services, and (3) adds a second,
+clearly-separated client-side code path (`agent/remote_client.py`) so the
+CLI can talk to that HTTP layer instead of opening SQLite directly.
+`SqliteUnitOfWork` and the pure-local CLI flow from Milestones 1-4 are
+completely unchanged and still work with zero server/Postgres setup - see
+"Local-only vs server-connected mode" below.
+
+### Layering (updated)
+
+```
+domain/          <- unchanged
+application/     <- unchanged business rules; +application/tokens.py (device token hashing, new)
+infrastructure/
+  sqlite/        <- unchanged, still the default for pure-local usage
+  postgres/      <- NEW: PostgresUnitOfWork + repositories, same ports as sqlite/
+agent/           <- +remote_client.py (HTTP client path), identity.py gained server_url/device_token
+integrations/    <- unchanged
+server/          <- NEW: FastAPI app exposing QuotaService/CapacityService/AgentService over HTTP
+cli/             <- unchanged commands; main() now picks a local or remote service pair per identity
+```
+
+### Postgres locking strategy: why, and exactly what it is
+
+**Isolation level: Postgres's default, READ COMMITTED - not
+SERIALIZABLE.** The reasoning is spelled out in full in
+`infrastructure/postgres/unit_of_work.py`'s module docstring; the short
+version: Postgres `SERIALIZABLE` achieves serializability by letting
+conflicting transactions proceed and then aborting one at COMMIT time with
+a `serialization_failure` the caller must retry. `QuotaService.consume()`/
+`CapacityService.approve_request()` have no retry loop around `with
+self._uow_factory() as uow: ... uow.commit()`, and this milestone's brief
+explicitly forbids touching that code - an aborted commit would surface as
+an unhandled `psycopg.errors.SerializationFailure` instead of the graceful
+`ConsumeResult(accepted=False, ...)`/`InsufficientSourceCapacityError`
+these services already return under SQLite. Explicit locking, taken
+*before* a transaction reads a row it might later write, avoids this by
+blocking a losing transaction instead of aborting it - a losing caller
+just waits longer and then proceeds against fresh data, exactly like
+SQLite's `BEGIN IMMEDIATE` already made it wait.
+
+**Locking primitive: Postgres transaction-scoped advisory locks
+(`pg_advisory_xact_lock`), not `SELECT ... FOR UPDATE`.** The first working
+version of `infrastructure/postgres/repositories.py` used plain row-level
+`FOR UPDATE` locking - the more commonly-reached-for idiom for this kind
+of problem - and it gave correct answers under light load. Under the real
+concurrency test adapted from Milestone 1
+(`tests/test_postgres_unit_of_work.py`), it reproducibly hit
+`psycopg.errors.DeadlockDetected`. This is a documented Postgres
+characteristic, not an ordering bug in this codebase: when 3+ backends all
+queue `SELECT ... FOR UPDATE` on one frequently-updated row (exactly what
+happens here - a small pool means heavy contention on very few
+`QuotaWindow` rows), each `UPDATE` creates a new MVCC tuple version, and
+the deadlock detector's wait-for graph over those tuple-version chains can
+report a cycle that isn't a real application-level deadlock. Advisory
+locks don't have this failure mode: they're plain mutexes in Postgres's
+lock manager with no MVCC/tuple involvement, so many transactions queuing
+on the same key is the textbook case they're built for - while they still
+participate fully in the deadlock detector for genuine cross-key cycles.
+See `infrastructure/postgres/locking.py`'s module docstring for the full
+writeup of this switch.
+
+**What's locked, and why it's sufficient - two mechanisms:**
+
+1. `QuotaWindowRepository.get()`/`list_by_member()`,
+   `CapacityGrantRepository.get()`, and `CapacityRequestRepository.get()`
+   each take an advisory lock keyed by the row's logical identity
+   (`member_id`+`window_type` for a window, an id for a grant/request)
+   *before* reading. Every check-then-write flow in `QuotaService`/
+   `CapacityService` reads the relevant `QuotaWindow` row before it reads
+   any `CapacityGrant` rows (`consume()`'s own-window fetch happens before
+   its shared-grants loop; `approve_request()`'s source-window fetch
+   happens before `member_grant_summary()`), so locking just the window is
+   sufficient to also serialize the grant-related over-commit checks in
+   the same transaction - `CapacityGrantRepository.list_by_source()`/
+   `list_by_recipient()` deliberately take no lock of their own, relying
+   on that ordering (documented at each call site).
+2. `UsageRecordRepository.find_by_idempotency_key()` takes an advisory
+   lock keyed by the idempotency key itself, before reading. This closes a
+   race row/window locking can't: two concurrent `consume()` calls sharing
+   a *never-before-seen* idempotency key have no existing row to lock onto
+   at all, so without this, both could see "not found," both proceed, and
+   one would hit the `usage_records` `UNIQUE(idempotency_key)` constraint
+   as an unhandled `IntegrityError` instead of a graceful idempotent
+   replay.
+
+**Consequence, matching Milestone 1's own stated tradeoff exactly:** since
+`get_status()`/`check_quota()`/`get_effective_capacity()` read through the
+same locking repository methods `consume()`/`approve_request()` do, reads
+serialize against writes and against each other here too - the same
+"every operation fully serializes" tradeoff Milestone 1's docs already
+called out for SQLite's `BEGIN IMMEDIATE` ("not the right tradeoff once a
+central server introduces real concurrent load... revisit this when the
+central server milestone is built"). This milestone deliberately does
+**not** revisit it: proving the exact same "no double-spend, no oversell"
+guarantee, unmodified, was the stated priority, and splitting genuinely
+read-only queries onto a non-locking snapshot-read path is real, identified,
+future work - not addressed here, exactly as flagged for it back in
+Milestone 1.
+
+**One known, accepted gap:** two `consume()` calls that draw SHARED
+capacity from *each other* in opposite directions at the same moment (A
+draws from B's window while B concurrently draws from A's) could in
+principle lock their own window, then block waiting for the other's -
+a genuine two-key deadlock, which Postgres's detector would correctly
+abort one side of (surfacing as an unhandled exception, since neither
+service retries). None of the required tests exercise this bidirectional
+pattern (the adapted Milestone 1 SHARED test is asymmetric: one member
+draws from another who never draws back), and fixing it would mean either
+a global lock-ordering scheme or retry logic in `QuotaService` - both out
+of scope here (the former adds real complexity for a scenario the trust
+model makes rare in a small pool; the latter touches forbidden code).
+Flagged here rather than silently accepted.
+
+**Insertion-order surrogate:** `MemberRepository.list_by_pool()` needs to
+return members in creation order (many callers, including most of this
+project's own tests, destructure `alice, bob = service.list_members(...)`
+positionally). SQLite gets this for free from its implicit `rowid`;
+Postgres has no equivalent, and `id` is a random UUID that doesn't sort
+that way - so `infrastructure/postgres/schema.py`'s `members` table has an
+extra `seq BIGSERIAL` column, ordered on but never exposed on the domain
+`Member` dataclass.
+
+### Minimal device-token auth: the design and why it's sufficient here
+
+**Mechanism.** `AgentService.register_device()` (extended, not replaced -
+existing Milestone 3 callers and tests are unaffected, see below) now also
+generates a 256-bit opaque token (`application/tokens.py:
+generate_device_token()`, `secrets.token_urlsafe(32)`) and stores only its
+SHA-256 hash (`Device.token_hash`) - the plaintext token is set on the
+`Device` object `register_device()` returns (`Device.token`) and
+*nowhere else*; it is never persisted and never returned again by any
+other call. The server's `POST /devices` endpoint is the only response
+that ever carries it. Every subsequent request presents it as
+`Authorization: Bearer <token>`; `server/auth.py:get_current_device()`
+hashes the presented token and looks up the owning `Device` by
+`token_hash`, rejecting an unknown/missing one with 401.
+`server/auth.py:require_member()` then re-checks, fresh, on every single
+request, that the resolved device's `user_id` actually owns the specific
+`member_id` the request is trying to act as (same check `join_pool()`
+already made locally in Milestone 3, just re-run per-request instead of
+once at `join` time, since HTTP has no persistent session to trust
+between calls) - a device authenticated as Alice can never act as Bob's
+member_id, even though both belong to the same server.
+
+**Why extending `Device`/`register_device()` didn't break Milestones 1-4.**
+`Device` gained two fields (`token_hash: str`, `token: str | None = None`)
+and `register_device()` now always mints a token - but every existing
+Milestone 3 caller (the local `login()`, every existing test) only ever
+reads `.id`/`.user_id`/`.device_name` off the returned `Device`, so nothing
+about their observed behavior changed; the local-only CLI flow simply
+never looks at `.token`. `DeviceRepository` gained one new abstract method
+(`find_by_token_hash`), implemented in both `sqlite/` and `postgres/`.
+
+**Why this is intentionally minimal - no OAuth, no JWT, no expiry/refresh,
+no scopes.** The trust model this whole project targets is a small,
+cooperative, already-trusted group - see the milestone's own framing:
+protecting against a malicious member is explicitly out of scope; what's
+in scope is "don't accidentally build something trivially broken over a
+real network." An opaque, 256-bit, hashed-at-rest bearer token checked on
+every request already defeats the realistic threat here (a stray or
+misconfigured device, or a stranger with no token at all, accidentally or
+opportunistically acting as someone else over the network) - it is not
+meant to, and does not need to, resist a sophisticated insider adversary
+within the trusted group. Anything more elaborate (rotation, short-lived
+JWTs, scoped tokens) would be complexity spent defending against a threat
+this milestone's own brief says is out of scope.
+
+**Two bootstrap exceptions - endpoints that require no token at all:**
+`POST /pools` (there is no prior identity to check against - this is how
+the first members/user_ids in a deployment come to exist; no pool exists
+yet, so no device/token can be scoped to one), and `POST /devices` (how a
+user_id-holder gets their *first* token - requiring a token to obtain one
+is circular). Listing members is not structurally unavoidable: the caller
+who just created a pool already receives the full member list in the
+`POST /pools` response body, and every other caller can present a valid
+bearer token. `GET /pools/{pool_id}/members` therefore requires
+authentication like every other endpoint. See `server/auth.py`/
+`server/routes.py`'s module docstrings for the full per-endpoint
+reasoning.
+
+### Transport security: TLS is required, and is not this app's job to provide
+
+Bearer tokens and quota/capacity data are sent as ordinary HTTP request/
+response bodies and headers - over plain HTTP, on any network path that
+isn't fully private (a shared LAN, a VPN with other tenants, the public
+internet), they are as sniffable as a plaintext password would be. **This
+server must be run behind TLS** (a reverse proxy - nginx, Caddy, an ALB, a
+managed ingress, etc.) for any real deployment; `server/main.py`
+deliberately does not terminate TLS itself, matching how FastAPI/uvicorn
+services are normally deployed and keeping certificate management out of
+this milestone's scope entirely. This is stated here, in
+`server/main.py`'s own docstring, and in README.md prominently - nothing
+in this milestone should read as "plain HTTP is fine for real use."
+
+### Local-only vs server-connected mode: how they coexist
+
+A `LocalIdentity` (`agent/identity.py`) now optionally carries
+`server_url`/`device_token`, both `None` for a purely local identity
+(Milestones 1-4 behavior, byte-for-byte unchanged - `load_local_identity`
+defaults missing keys to `None`, so an existing pre-Milestone-5
+`config.json` still round-trips to an identical `LocalIdentity`).
+`cli/main.py:main()` makes exactly one decision, once, right after loading
+the identity: if `identity.is_remote` (i.e. `server_url` is set), build
+`RemoteQuotaService`/`RemoteCapacityService` (`agent/remote_client.py`)
+around that server_url/device_token; otherwise, build the same
+`QuotaService`/`CapacityService` around `SqliteUnitOfWork` exactly as
+before. Every `_cmd_*` function in `cli/main.py` is completely unchanged -
+they only ever call methods like `.get_status()`/`.consume()` on whatever
+service object they were handed, never construct one themselves or check
+which mode they're in. `login --server <url>` is the one command that
+*sets* remote mode (`agent.commands.login_remote()`); `pool create
+--server <url>` can bootstrap a pool on an arbitrary server even before
+any identity is configured (or with a different one already configured),
+exactly mirroring the server's own no-auth bootstrap exception.
+
+### Why the remote client is a separate HTTP path, not a UnitOfWork adapter
+
+`UnitOfWork` is a transaction boundary over *repositories* - built so
+`consume()` can do "read a row, maybe read a few more, write updated rows,
+atomically" without knowing whether SQLite or Postgres is underneath. A
+call to `POST /quota/consume` isn't shaped like that: it's one
+already-composed round trip to a *remote copy* of the entire `consume()`
+method, not a sequence of individual repository operations this process
+could wrap in its own transaction. Making `RemoteQuotaService` implement
+`UnitOfWork`/the repository ports would mean inventing fake repository
+methods that either make their own separate HTTP call each (destroying
+atomicity) or buffer state client-side against a batching scheme the
+server doesn't support - it doesn't stretch cleanly, it would misrepresent
+what's actually happening over the wire. So `agent/remote_client.py`
+instead duck-types `QuotaService`/`CapacityService`/`AgentService`'s own
+*public methods* directly (one HTTP call each), returning the exact same
+`application/dto.py`/`domain/models.py` dataclasses the local services
+return - which is what lets every existing `_cmd_*` function and
+`agent/commands.py:agent_status()` work unchanged against either mode. See
+`agent/remote_client.py`'s own module docstring for the full reasoning.
+
+### HTTP layer: one endpoint per existing application method, nothing more
+
+`server/routes.py` is a thin adapter: every handler either forwards
+straight to `QuotaService`/`CapacityService`/`AgentService` and converts
+the returned dataclass to a `server/schemas.py` Pydantic model for
+serialization, or (for the ownership-checked ones) does that after calling
+`server/auth.py:require_member()` once. No business rule, quota
+arithmetic, or capacity-delegation logic is duplicated at this layer - a
+`DomainError` raised by a service is left to propagate to a FastAPI
+exception handler (`server/app.py`, using `server/errors.py`'s status-code
+mapping) rather than being caught and re-implemented as a check here. A
+`consume()` call rejecting for an ordinary business reason (insufficient
+guaranteed+shared capacity) is not an HTTP error at all - it's a normal
+`200` response with `accepted: false`, exactly mirroring the local CLI's
+non-crashing exit-code-2 for the same case.
+
+### Deliberately out of scope for Milestone 5
+
+Per the milestone brief: no browser extension, no Desktop/Cowork
+integration, no dashboard/UI, no real Anthropic OAuth/account integration,
+no TLS termination inside the FastAPI app itself, no rate limiting/IP
+allowlisting/other adversarial-hardening beyond the identity-verification
+auth described above (the trust model here remains "all members are
+cooperative" - see the milestone's own framing), and no change whatsoever
+to the domain/application quota or capacity-delegation rules. A background
+sweep for lazily-expiring grants, splitting read-only queries onto a
+non-locking Postgres path, and resolving the bidirectional-SHARED-draw
+deadlock gap all remain identified, real, future work - not addressed
+here.
+
+---
+
+## Milestone 6 — Browser Extension (claude.ai, Manifest V3)
+
+### What problem this solves, and what it deliberately is not
+
+Milestones 1–5 give quota visibility to CLI users and Claude Code users
+(via the `UserPromptSubmit` hook). Milestone 6 adds the same *visibility*
+for people using **claude.ai directly in a browser** — backed by the
+**same Milestone 5 central server and device-token auth**, with **zero
+new quota business logic** on either client or server.
+
+**This is explicitly weaker enforcement than the Claude Code hook.**
+Anthropic documents a first-party "block before send" hook for Claude Code;
+claude.ai has no equivalent stable API. The extension can only observe/inject
+into the page DOM and best-effort intercept send actions. That dependency is
+**fragile** (breaks silently when claude.ai's frontend changes) and
+**bypassable** (override button, DevTools, alternate UI paths). See
+`extension/README.md` for the full reliability limitations — stated
+prominently there, not buried.
+
+Design principles carried over from Milestone 4's hook:
+
+- **Soft enforcement only** — persistent indicator + warning + best-effort
+  send interception when exhausted, with an obvious override
+- **Fail open** — if selectors fail, the server is unreachable, or anything
+  throws internally, the extension must not trap the user on claude.ai
+  (no stuck UI, no visible page errors)
+- **Requires Milestone 5 server** — pure local-SQLite mode is impossible
+  from a browser extension
+
+### New component: `extension/`
+
+A separate TypeScript Manifest V3 package (not part of the Python wheel):
+
+```
+extension/
+  manifest.json          Manifest V3 (Chrome/Chromium)
+  src/
+    background.ts        polls GET /members/{id}/status + /capacity
+    content.ts           indicator + best-effort send intercept on claude.ai
+    quota.ts             formatting/decision logic (mirrors hook.py)
+    intercept.ts         DOM helpers (testable in isolation)
+    api.ts               HTTP client for background/popup only
+    popup/popup.ts       configure server URL + device token + member_id
+  tests/                 Vitest + jsdom
+  README.md              install/configure/limitations (read this first)
+```
+
+**Auth:** reuses Milestone 5's existing `POST /devices` bootstrap and
+`Authorization: Bearer <token>` on subsequent calls — no second auth
+mechanism. Token stored in `chrome.storage.local` (not sync).
+
+**API calls:** originate from the **background service worker and popup**,
+never from the claude.ai page context. The content script only receives
+quota snapshots via `chrome.runtime` messaging.
+
+### Server-side changes for the extension
+
+**No new endpoints. No CORS middleware added.**
+
+Investigation: Manifest V3 extension pages (background worker, popup) with
+**host permissions** granted for the configured server URL make `fetch()`
+calls that are **not subject to normal web-page CORS policy**. Content
+scripts on claude.ai do not call the server directly (by design), so
+claude.ai's origin never needs to be listed in `Access-Control-Allow-Origin`.
+The popup requests optional host permission (`http://*/*`, `https://*/*`) at
+configure time via `chrome.permissions.request()` for the specific server
+origin pattern.
+
+If a future milestone adds a regular web dashboard served from a browser tab,
+*that* would likely need explicit CORS configuration — out of scope here.
+
+### DOM dependency (fragile by design)
+
+The content script (`extension/src/intercept.ts`) heuristically targets:
+
+- Send button: `button[aria-label*="Send"]`, `button[data-testid*="send"]`,
+  `button[type="submit"]`
+- Input area: `[contenteditable="true"][role="textbox"]`, `textarea`,
+  composer `[contenteditable]` descendants
+
+If neither element is found, the script **fail-opens** (no UI, no intercept).
+A `MutationObserver` re-attaches when the SPA DOM changes. See
+`extension/README.md` for the full selector table and bypass/override behavior.
+
+### Deliberately out of scope for Milestone 6
+
+Per the milestone brief: no Chrome Web Store packaging, no Firefox/Safari
+support, no new server business logic, no real Anthropic account integration,
+no Desktop/Cowork integration, no dashboard beyond the extension's own popup/
+indicator UI, and no hard blocking beyond best-effort send interception as
+scoped above.

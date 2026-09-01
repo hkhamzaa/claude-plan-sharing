@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Claude Share",
+  "version": "0.1.0",
+  "description": "Quota visibility and best-effort send warnings for claude.ai via a Claude Share central server.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://*.claude.ai/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://claude.ai/*", "https://*.claude.ai/*"],
+      "js": ["dist/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Claude Share"
+  }
+}

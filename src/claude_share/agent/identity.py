@@ -30,6 +30,14 @@ class LocalIdentity:
     `pool_id`/`member_id` are None after `login()` but before `join_pool()`
     - a device can be logged in as a user without yet having chosen which
     pool/member it acts as.
+
+    `server_url`/`device_token` (Milestone 5) are None for a purely local
+    identity (Milestones 1-4's behavior, unchanged) and both set together
+    when this machine has instead registered against a central server via
+    `agent.commands.login_remote()` - see `agent/remote_client.py`. Exactly
+    one of "local SQLite" or "remote HTTP" mode is active for a given
+    identity at a time; `cli/main.py` decides which by checking whether
+    `server_url` is set, never by inspecting both.
     """
 
     pool_id: str | None
@@ -37,6 +45,12 @@ class LocalIdentity:
     user_id: str
     device_id: str
     device_name: str
+    server_url: str | None = None
+    device_token: str | None = None
+
+    @property
+    def is_remote(self) -> bool:
+        return self.server_url is not None
 
 
 def load_local_identity(config_path: str | Path) -> LocalIdentity | None:
@@ -52,6 +66,8 @@ def load_local_identity(config_path: str | Path) -> LocalIdentity | None:
         user_id=data["user_id"],
         device_id=data["device_id"],
         device_name=data["device_name"],
+        server_url=data.get("server_url"),
+        device_token=data.get("device_token"),
     )
 
 
