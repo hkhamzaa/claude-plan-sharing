@@ -231,7 +231,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("whoami", help="Show this machine's local identity and status.")
 
-    hook_parser = subparsers.add_parser("hook", help="Manage the Claude Code UserPromptSubmit hook.")
+    hook_parser = subparsers.add_parser("hook", help="Manage the Claude Code quota hooks.")
     hook_subparsers = hook_parser.add_subparsers(dest="hook_command", required=True)
 
     hook_install_parser = hook_subparsers.add_parser(
@@ -518,9 +518,11 @@ def _cmd_hook_install(args: argparse.Namespace) -> int:
     settings_path = _resolve_hook_settings_path(args.scope)
     installed = install_hook(settings_path)
     if installed:
-        print(f"Installed the Claude Share UserPromptSubmit hook into {settings_path}.")
+        print(
+            f"Installed the Claude Share UserPromptSubmit and Stop hooks into {settings_path}."
+        )
     else:
-        print(f"Claude Share hook is already installed in {settings_path} (no changes made).")
+        print(f"Claude Share hooks are already installed in {settings_path} (no changes made).")
     return 0
 
 

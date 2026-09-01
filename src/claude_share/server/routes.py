@@ -46,7 +46,13 @@ from claude_share.application.capacity_service import CapacityService
 from claude_share.application.quota_service import QuotaService
 from claude_share.domain.models import Device, WindowType
 from claude_share.domain.repository import UnitOfWork
-from claude_share.server.auth import get_agent_service, get_current_device, get_uow_factory, require_member
+from claude_share.server.auth import (
+    get_agent_service,
+    get_current_device,
+    get_uow_factory,
+    require_member,
+    require_pool_membership,
+)
 from claude_share.server.schemas import (
     ApproveRequestBody,
     CapacityGrantOut,
@@ -61,7 +67,9 @@ from claude_share.server.schemas import (
     EffectiveCapacityOut,
     MemberOut,
     MemberGrantsOut,
+    MemberPoolOverviewOut,
     MemberStatusOut,
+    PoolOverviewOut,
     QuotaCheckResultOut,
     RegisterDeviceRequest,
     RejectRequestBody,
@@ -116,6 +124,42 @@ def list_members(
     _ = device  # authenticated; no member_id ownership check on this read-only pool directory
     members = quota_service.list_members(pool_id)
     return [member_out(m) for m in members]
+
+
+@router.get("/pools/{pool_id}/overview", response_model=PoolOverviewOut)
+def get_pool_overview(
+    pool_id: str,
+    device: Device = Depends(get_current_device),
+    uow_factory: Callable[[], UnitOfWork] = Depends(get_uow_factory),
+    quota_service: QuotaService = Depends(get_quota_service),
+    capacity_service: CapacityService = Depends(get_capacity_service),
+) -> PoolOverviewOut:
+    """Batch read for the dashboard pool overview: each member's status
+    (both windows) and effective capacity (both windows) in one response.
+
+    Calls the existing `QuotaService.get_status()` and
+    `CapacityService.get_effective_capacity()` once per member — the same
+    work the dashboard previously fanned out client-side."""
+    require_pool_membership(uow_factory, device, pool_id)
+    members = quota_service.list_members(pool_id)
+    rows: list[MemberPoolOverviewOut] = []
+    for member in members:
+        status = quota_service.get_status(member.id)
+        rows.append(
+            MemberPoolOverviewOut(
+                member=member_out(member),
+                status=member_status_out(status),
+                capacity={
+                    WindowType.FIVE_HOUR: effective_capacity_out(
+                        capacity_service.get_effective_capacity(member.id, WindowType.FIVE_HOUR)
+                    ),
+                    WindowType.WEEKLY: effective_capacity_out(
+                        capacity_service.get_effective_capacity(member.id, WindowType.WEEKLY)
+                    ),
+                },
+            )
+        )
+    return PoolOverviewOut(pool_id=pool_id, members=rows)
 
 
 # --- quota ---------------------------------------------------------------

@@ -296,6 +296,7 @@ def test_cli_hook_install_and_uninstall_project_scope(
 
     data = json.loads(settings_path.read_text(encoding="utf-8"))
     assert data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "claude-share-hook"
+    assert data["hooks"]["Stop"][0]["hooks"][0]["command"] == "claude-share-stop-hook"
 
     # Idempotent: installing again makes no changes.
     exit_code = main([*base, "hook", "install", "--project"])

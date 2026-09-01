@@ -111,3 +111,29 @@ def require_member(uow_factory: Callable[[], UnitOfWork], device: Device, member
             detail=f"Device {device.id!r} is not authorized to act as member {member_id!r}.",
         )
     return member
+
+
+def require_pool_membership(
+    uow_factory: Callable[[], UnitOfWork], device: Device, pool_id: str
+) -> Member:
+    """Confirm the authenticated device belongs to `pool_id`.
+
+    Reuses the same ownership rule as `require_member()` — the device's
+    `user_id` must own a member row in this pool. Raises 404 when the pool
+    does not exist, 403 when the device has no member in it."""
+    with uow_factory() as uow:
+        pool = uow.pools.get(pool_id)
+        if pool is None:
+            uow.rollback()
+            raise HTTPException(status_code=404, detail=f"Pool {pool_id!r} not found.")
+        members = uow.members.list_by_pool(pool_id)
+        uow.commit()
+
+    for member in members:
+        if member.user_id == device.user_id:
+            return member
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"Device {device.id!r} is not authorized to access pool {pool_id!r}.",
+    )

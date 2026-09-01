@@ -26,27 +26,15 @@ for its quota decision - see `_read_stdin_event()` below. It reads and
 parses stdin only as good hook hygiene (fully draining it), not because
 anything here inspects the prompt, the session, or the cwd.
 
-## Two limitations, stated prominently (not discovered later)
+## Pre-check only — real metering happens in the Stop hook
 
-1. **Placeholder cost, not real usage metering.** This hook has no way to
-   know a prompt's actual Claude token/resource cost *before* the prompt
-   runs - no such estimator exists anywhere in this project yet. It
-   checks availability against a fixed `PLACEHOLDER_PROMPT_COST_UNITS`
-   per prompt (default: 1 abstract unit - see docs/architecture.md
-   "Quota units are entirely abstract", Milestone 1). It never calls
-   `consume()` with anything other than this placeholder, and in fact
-   this hook does not call `consume()` at all (see next point). Real
-   usage attribution is out of scope until a future milestone defines a
-   UsageProvider that can report actual consumption after the fact.
-
-2. **This hook never calls `consume()`.** It only checks availability
-   (`QuotaService.get_status()` + `CapacityService.get_effective_capacity()`)
-   - it does not deduct anything. Milestone 4's scope is "check before
-   the prompt runs," not "meter what the prompt actually cost." Without
-   a real UsageProvider, there is nothing correct to consume() here yet:
-   consuming the placeholder cost unconditionally on every prompt would
-   just be a fake usage counter dressed up as real metering, which is
-   worse than not pretending to meter at all.
+The upcoming prompt's token cost is unknowable before it runs. This hook
+therefore checks only whether the member has **any** remaining guaranteed
+FIVE_HOUR capacity right now (`remaining_units > 0`), not whether a
+specific placeholder amount would fit. Actual consumption is recorded
+after the turn completes by the companion `Stop` hook
+(`stop_hook.py`), which reads Claude Code's reported token counts from
+the session transcript and calls `QuotaService.consume()`.
 
 ## Fail-open error handling
 
@@ -69,25 +57,20 @@ Claude Code experience.
 
 from __future__ import annotations
 
-import json
-import os
 import sys
-import traceback
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-from claude_share.agent.identity import DEFAULT_CONFIG_PATH, load_local_identity
+from claude_share.agent.identity import load_local_identity
 from claude_share.domain.models import TOTAL_ALLOCATION_BPS, WindowType
+from claude_share.integrations.claude_code._common import (
+    log_hook_error,
+    read_stdin_event,
+    resolve_config_path,
+    resolve_db_path,
+)
 
 #: Branding line shown at the top of both the warning and block messages.
 BRAND_NAME = "Claude Share"
-
-#: Fixed placeholder cost charged against a member's guaranteed FIVE_HOUR
-#: capacity for every prompt, regardless of the prompt's actual content or
-#: real Claude token/resource cost. THIS IS NOT REAL USAGE METERING and is
-#: never actually deducted by this hook (it doesn't call consume()) - see
-#: module docstring.
-PLACEHOLDER_PROMPT_COST_UNITS: int = 1
 
 #: Warn (but still allow) once a member's remaining guaranteed FIVE_HOUR
 #: capacity drops below this fraction of their own guaranteed ceiling.
@@ -97,46 +80,7 @@ PLACEHOLDER_PROMPT_COST_UNITS: int = 1
 #: half of a window. Not user-configurable in this milestone.
 WARNING_THRESHOLD_FRACTION: float = 0.20
 
-#: Mirrors cli/main.py's DEFAULT_DB_PATH. Duplicated (not imported) so this
-#: module stays standalone and fast to import - it does not need argparse
-#: or any other CLI machinery just to resolve a path.
-DEFAULT_DB_PATH = Path.home() / ".claude-share" / "claude_share.db"
-
-
-def _resolve_config_path() -> Path:
-    env_value = os.environ.get("CLAUDE_SHARE_CONFIG")
-    if env_value:
-        return Path(env_value)
-    return DEFAULT_CONFIG_PATH
-
-
-def _resolve_db_path() -> Path:
-    env_value = os.environ.get("CLAUDE_SHARE_DB")
-    if env_value:
-        return Path(env_value)
-    return DEFAULT_DB_PATH
-
-
-def _read_stdin_event() -> dict:
-    """Best-effort read+parse of the hook's stdin JSON payload.
-
-    Nothing in this module depends on any field of this payload (see
-    module docstring) - it's read only to fully drain stdin, a small
-    hygiene courtesy to the parent process. A read/parse failure here is
-    swallowed rather than raised: since no field is ever used, a failure
-    to read it must never affect the quota decision or trip fail-open for
-    an unrelated reason.
-    """
-    try:
-        raw = sys.stdin.read()
-    except Exception:
-        return {}
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
+HOOK_NAME = "UserPromptSubmit hook"
 
 
 def _format_duration(delta: timedelta) -> str:
@@ -174,25 +118,10 @@ def _render_message(headline: str, guaranteed_units: int, used_units: int, reset
     )
 
 
-def _log_error(exc: BaseException) -> None:
-    """Best-effort local error log for debugging a fail-open event.
-
-    Must never itself raise or block - if writing the log fails too, the
-    hook still exits 0 (see `main()`)."""
-    try:
-        log_path = _resolve_config_path().parent / "hook.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} [UserPromptSubmit hook] ")
-            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
-    except Exception:
-        pass
-
-
 def _run() -> int:
-    _read_stdin_event()  # drained, unused - see module docstring
+    read_stdin_event()  # drained, unused - see module docstring
 
-    identity = load_local_identity(_resolve_config_path())
+    identity = load_local_identity(resolve_config_path())
     if identity is None or identity.pool_id is None or identity.member_id is None:
         return 0  # strictly opt-in: nothing configured, do not interfere
 
@@ -203,7 +132,7 @@ def _run() -> int:
     from claude_share.application.quota_service import QuotaService
     from claude_share.infrastructure.sqlite.unit_of_work import SqliteUnitOfWork
 
-    uow_factory = lambda: SqliteUnitOfWork(_resolve_db_path())
+    uow_factory = lambda: SqliteUnitOfWork(resolve_db_path())
     quota_service = QuotaService(uow_factory=uow_factory)
     capacity_service = CapacityService(uow_factory=uow_factory)
 
@@ -216,7 +145,7 @@ def _run() -> int:
     remaining_units = max(guaranteed_units - used_units, 0)
     now = datetime.now(timezone.utc)
 
-    if remaining_units < PLACEHOLDER_PROMPT_COST_UNITS:
+    if remaining_units <= 0:
         message = _render_message("Allocation exhausted.", guaranteed_units, used_units, window_status.reset_at, now)
         print(message, file=sys.stderr)
         return 2
@@ -238,7 +167,7 @@ def main() -> int:
     try:
         return _run()
     except Exception as exc:
-        _log_error(exc)
+        log_hook_error(HOOK_NAME, exc)
         return 0
 
 

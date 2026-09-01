@@ -4,7 +4,8 @@ Covers Milestone 1 (local quota engine: pools, members, allocation,
 windows, idempotent consume), Milestone 2 (SOLID/SHARED capacity
 delegation between members of a pool), Milestone 3 (local identity/device
 layer), and Milestone 4 (a Claude Code `UserPromptSubmit` hook).
-Milestone-specific sections are labeled below.
+Milestone 8 adds real token-count-based metering via a companion `Stop`
+hook. Milestone-specific sections are labeled below.
 
 ## Layering
 
@@ -764,6 +765,175 @@ notifications beyond the stdout warning / stderr block message.
 
 ---
 
+## Milestone 8 — Real token-count-based usage metering (two-hook design)
+
+### What changed from Milestone 4
+
+Milestone 4's `UserPromptSubmit` hook used a fixed placeholder cost
+(`PLACEHOLDER_PROMPT_COST_UNITS = 1`) as a pre-check heuristic and
+deliberately never called `consume()`. Milestone 8 replaces that metering
+gap with **real, measured token-count-based consumption** recorded after
+each turn completes, while keeping the pre-prompt hook as a lightweight
+availability gate.
+
+This is **genuine measured-token metering** — units are computed from
+Claude Code's own reported `input_tokens` / `output_tokens` for each
+completed assistant turn — but it is **not identical to Anthropic's
+internal account-level accounting**. Claude Share does not see Anthropic's
+full billing ledger: system-prompt overhead, prompt-cache read/write
+discounts, background API calls that never reach the transcript, and other
+vendor-internal pricing nuances are outside what the transcript exposes.
+Describe this as "real token-count-based metering from Claude Code's
+reported counts," not as "real Anthropic usage."
+
+### The verified integration mechanism (Stop hook)
+
+Researched against Anthropic's official Claude Code hooks reference
+(<https://docs.anthropic.com/en/docs/claude-code/hooks>, "Stop" and
+"Common input fields" sections, confirmed March 2026):
+
+1. **`Stop` fires once per turn** when the main Claude Code agent finishes
+   responding (not on user interrupt; API errors fire `StopFailure`
+   instead).
+2. **The Stop stdin payload does not include token counts.** Documented
+   fields include `session_id`, `transcript_path`, `cwd`,
+   `hook_event_name`, `last_assistant_message`, `stop_hook_active`, and
+   (v2.1.196+) `prompt_id`. There is no `usage` object on the payload
+   itself — community reports and an open feature request
+   (anthropics/claude-code#80446) confirm the same.
+3. **Token counts live in the session transcript JSONL** that
+   `transcript_path` points to. The hooks reference documents that
+   transcript writes are **asynchronous** and may lag the in-memory
+   conversation when a hook fires; assistant entries carry
+   `message.usage` with at least `input_tokens` and `output_tokens`
+   (same shape as PostToolUse's documented `tool_response.usage` object).
+4. **`stop_hook.py` polls `transcript_path`** with exponential backoff
+   (50 ms initial interval, up to 8 seconds total) until the last
+   `type: "assistant"` line exposes a parseable `message.usage`, or gives
+   up and consumes zero units (fail-open).
+
+Implementation files:
+
+- `integrations/claude_code/stop_hook.py` — Stop hook entry point
+  (`claude-share-stop-hook` console script)
+- `integrations/claude_code/metering.py` — transcript parsing, weighting
+  formula, idempotency-key derivation
+- `integrations/claude_code/hook.py` — updated UserPromptSubmit pre-check
+- `integrations/claude_code/settings.py` — installs/uninstalls **both**
+  hooks idempotently
+
+### Two-hook design: pre-check + post-consume
+
+| Hook | Event | When | Job |
+|------|-------|------|-----|
+| `claude-share-hook` | `UserPromptSubmit` | Before each prompt | Block/warn if **no** guaranteed FIVE_HOUR capacity remains (`remaining_units <= 0`); cannot know upcoming token cost |
+| `claude-share-stop-hook` | `Stop` | After each turn | Read measured token counts from transcript → convert to units → `consume()` |
+
+**Why the pre-check changed:** the upcoming prompt's token cost is
+unknowable before it runs. The UserPromptSubmit hook no longer compares
+against a placeholder per-prompt cost; it only answers "does this member
+have any meaningful guaranteed capacity left right now?" Real cost is
+charged after the fact by the Stop hook.
+
+Both hooks remain **strictly opt-in** (no login/join → exit 0, no-op) and
+**fail-open** on internal errors (log to `<config_dir>/hook.log`, never
+crash or block Claude Code because of a metering bug). The Stop hook always
+exits 0 — there is nothing left to block after a turn completes.
+
+### Token → units weighting formula
+
+Named constants in `metering.py` (adjustable without an architecture
+change):
+
+```text
+INPUT_TOKEN_WEIGHT  = 1
+OUTPUT_TOKEN_WEIGHT = 5
+TOKEN_WEIGHT_SCALE  = 1000
+
+weighted = (input_tokens * INPUT_TOKEN_WEIGHT) + (output_tokens * OUTPUT_TOKEN_WEIGHT)
+units    = max(1, ceil(weighted / TOKEN_WEIGHT_SCALE))   # 0 tokens → 0 units (no consume)
+```
+
+**Reasoning:** Anthropic's public API pricing for Sonnet-class models
+charges output tokens at roughly five times the input-token rate (e.g.
+~$3/M input vs ~$15/M output). Using a 1:5 input:output weight ratio
+mirrors that relative cost shape without tying abstract units to dollars.
+`TOKEN_WEIGHT_SCALE` keeps typical turns in the tens-of-units range so
+numbers stay comparable to Milestone 1 pool allocations (thousands of
+units per member per window), not raw token counts.
+
+### `consume()` wiring and remote mode
+
+The Stop hook calls the existing `QuotaService.consume()` (local SQLite
+via `SqliteUnitOfWork`) or `RemoteQuotaService.consume()` (HTTP
+`POST /quota/consume`) when the local identity has `server_url` set —
+the same mode split as `cli/main.py`. Window type is always
+`FIVE_HOUR`, matching the UserPromptSubmit pre-check.
+
+If token data is missing/malformed, polling times out, or `consume()`
+raises, the hook logs and exits 0 with **zero consumption** — never a
+guessed fallback amount.
+
+### Idempotency-key derivation
+
+Stop hooks can re-fire (e.g. session `--resume` replay semantics, hook
+re-invocation). `QuotaService.consume()`'s existing idempotency guard
+prevents double-charging:
+
+1. **Primary key (preferred):** `claude-code-stop:{prompt_id}` where
+   `prompt_id` is the UUID from the Stop payload's common fields
+   (documented v2.1.196+, identifies the user prompt for the turn).
+2. **Fallback (older Claude Code):** `claude-code-stop:{session_id}:{turn_index}`
+   where `turn_index` is the zero-based index of the last
+   `type: "assistant"` entry in the transcript when usage is read
+   (i.e. count of assistant lines minus one).
+
+A replay with the same key and same amount returns `replayed=True` from
+`consume()` without incrementing usage again.
+
+### `hook install` / `hook uninstall` (updated)
+
+`settings.py` now registers **both** console scripts:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "claude-share-hook" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "claude-share-stop-hook" }] }
+    ]
+  }
+}
+```
+
+Merge/idempotent/uninstall behavior from Milestone 4/6 is unchanged: only
+these two command entries are added or removed; all other settings and
+hooks are preserved.
+
+### Extension and dashboard impact
+
+**No changes required.** Both surfaces already read
+`GET /members/{id}/status` (`used_units`) and
+`GET /members/{id}/capacity` (`guaranteed_units`). Milestone 8 only
+changes *how* `used_units` gets incremented (real `consume()` from the Stop
+hook instead of manual CLI `consume` or nothing). Response shapes are
+unchanged.
+
+The browser extension still uses its own placeholder pre-check for
+claude.ai send interception (Milestone 6 scope); that is a separate
+enforcement surface from Claude Code metering.
+
+## Deliberately out of scope for Milestone 8
+
+SOLID/SHARED delegation logic changes, browser-extension core changes
+(beyond confirming API compatibility), non-Claude-Code integrations,
+TLS/deployment, dashboard batch endpoint, and aligning the extension's
+placeholder web pre-check to token-based metering.
+
+---
+
 ## Milestone 5 — Central Server (multi-device coordination)
 
 ### What problem this solves, and what stays exactly the same
@@ -962,19 +1132,39 @@ authentication like every other endpoint. See `server/auth.py`/
 `server/routes.py`'s module docstrings for the full per-endpoint
 reasoning.
 
-### Transport security: TLS is required, and is not this app's job to provide
+### Transport security: Tailscale for this deployment (Milestone 9)
 
 Bearer tokens and quota/capacity data are sent as ordinary HTTP request/
-response bodies and headers - over plain HTTP, on any network path that
-isn't fully private (a shared LAN, a VPN with other tenants, the public
-internet), they are as sniffable as a plaintext password would be. **This
-server must be run behind TLS** (a reverse proxy - nginx, Caddy, an ALB, a
-managed ingress, etc.) for any real deployment; `server/main.py`
-deliberately does not terminate TLS itself, matching how FastAPI/uvicorn
-services are normally deployed and keeping certificate management out of
-this milestone's scope entirely. This is stated here, in
-`server/main.py`'s own docstring, and in README.md prominently - nothing
-in this milestone should read as "plain HTTP is fine for real use."
+response bodies and headers. Over the **public internet** in plain HTTP,
+they are as sniffable as a plaintext password.
+
+**`claude-share-server` does not terminate TLS** (see `server/main.py`) —
+certificate management stays out of the application, matching how FastAPI/
+uvicorn services are normally deployed.
+
+For **this project's chosen deployment** (a small, fixed, trusted group —
+not a public service), the documented solution is **Tailscale**: a private
+WireGuard mesh so only tailnet members can reach the server, with traffic
+encrypted between devices and **no public port 8001 exposure required**. See
+[docs/TAILSCALE_SETUP.md](TAILSCALE_SETUP.md) for step-by-step server and
+Windows client setup, migrating clients off a public IP, and closing Oracle
+Cloud / iptables exposure.
+
+**Why Tailscale here (and not Caddy/nginx on a public domain):** every user
+is a known person who can install one app; no anonymous public clients; no
+domain or certificate renewal; simpler ops. **Trade-off:** each person's
+device must join the tailnet — wrong model for a public-facing SaaS.
+
+Within the tailnet, clients use `http://100.x.y.z:PORT` or MagicDNS
+(`http://<device>.<tailnet>.ts.net:PORT`). That is HTTP at the application
+layer but **not** cleartext on the public internet — Tailscale encrypts the
+path. The codebase accepts any valid `http`/`https` base URL (no hostname-
+format restrictions); the browser extension's optional `http://*/*` host
+permission already covers Tailscale addresses.
+
+A **public reverse proxy + TLS** remains a valid pattern for other
+deployments but is intentionally **not** documented here (Milestone 9
+scope).
 
 ### Local-only vs server-connected mode: how they coexist
 
@@ -1181,14 +1371,46 @@ Repository port added: `CapacityRequestRepository.list_pending_by_target()`.
 Application methods: `CapacityService.list_pending_requests_for_target()`
 and `list_active_grants()`.
 
-### Pool overview fan-out
+### Pool overview fan-out (superseded by Milestone 10)
 
-The pool overview view calls `GET /pools/{pool_id}/members` once, then
+Milestone 7 originally called `GET /pools/{pool_id}/members` once, then
 for each member `GET /members/{id}/status` plus `GET /members/{id}/capacity`
-for both window types — **5 HTTP calls per member** after the initial list.
-For the small trusted pools this project targets, that is acceptable; a
-future `GET /pools/{id}/overview` batch endpoint would reduce round-trips
-but would require new aggregation logic and was intentionally deferred.
+for both window types — **1 + 3N HTTP calls** per refresh (e.g. 13 calls
+for a 4-person pool). That was acceptable for small pools but was flagged
+as something a batch endpoint should eventually replace.
+
+### Milestone 10 — `GET /pools/{pool_id}/overview`
+
+Adds a read-only aggregation endpoint that returns, for every pool member
+in one response:
+
+- `member` summary (`MemberOut`)
+- `status` (`MemberStatusOut`, both windows)
+- `capacity` map (`EffectiveCapacityOut` for `five_hour` and `weekly`)
+
+**Authorization:** bearer token required; `require_pool_membership()`
+checks that the authenticated device's `user_id` owns a member row in
+`pool_id` (same ownership rule as `require_member()`, pool-scoped).
+
+**Implementation:** the handler calls existing
+`QuotaService.get_status()` and `CapacityService.get_effective_capacity()`
+once per member — no duplicated quota math. Each service method opens its
+own `UnitOfWork` transaction internally; the batch endpoint does **not**
+wrap all members in a single database transaction. That matches what the
+old client-side fan-out did (independent per-member reads) and avoids
+refactoring services to accept an external unit-of-work. A single
+point-in-time snapshot across all members would require that deeper
+change; for the small/moderate pools this project targets, per-member
+consistency is sufficient.
+
+The dashboard pool overview (and member-name lookups on pending/grants
+views) now call this endpoint instead of fanning out.
+
+Per-member `GET /members/{id}/status` and `GET /members/{id}/capacity`
+remain unchanged for the CLI and extension.
+
+Pagination was not added — realistic pool sizes here stay small enough
+that one response per pool is fine.
 
 ### Deliberately out of scope for Milestone 7
 

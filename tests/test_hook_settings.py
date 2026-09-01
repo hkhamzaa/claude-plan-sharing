@@ -6,6 +6,8 @@ from pathlib import Path
 from claude_share.integrations.claude_code.settings import (
     HOOK_COMMAND_NAME,
     HOOK_EVENT_NAME,
+    STOP_COMMAND,
+    STOP_EVENT,
     install_hook,
     uninstall_hook,
 )
@@ -16,6 +18,11 @@ def _all_commands(settings: dict, event_name: str = HOOK_EVENT_NAME) -> list[str
     return [entry["command"] for group in groups for entry in group.get("hooks", [])]
 
 
+def _installed_commands(settings: dict) -> dict[str, list[str]]:
+    hooks = settings.get("hooks", {})
+    return {event: _all_commands(settings, event) for event in hooks}
+
+
 def test_install_hook_creates_new_file_with_valid_json(tmp_path: Path) -> None:
     settings_path = tmp_path / ".claude" / "settings.json"
     installed = install_hook(settings_path)
@@ -23,7 +30,10 @@ def test_install_hook_creates_new_file_with_valid_json(tmp_path: Path) -> None:
     assert installed is True
     assert settings_path.exists()
     data = json.loads(settings_path.read_text(encoding="utf-8"))
-    assert _all_commands(data) == [HOOK_COMMAND_NAME]
+    assert _installed_commands(data) == {
+        HOOK_EVENT_NAME: [HOOK_COMMAND_NAME],
+        STOP_EVENT: [STOP_COMMAND],
+    }
 
 
 def test_install_hook_merges_with_existing_unrelated_settings(tmp_path: Path) -> None:
@@ -47,7 +57,8 @@ def test_install_hook_merges_with_existing_unrelated_settings(tmp_path: Path) ->
     data = json.loads(settings_path.read_text(encoding="utf-8"))
     assert data["otherSetting"] is True
     assert data["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "some-other-tool"
-    assert _all_commands(data) == [HOOK_COMMAND_NAME]
+    assert _installed_commands(data)[HOOK_EVENT_NAME] == [HOOK_COMMAND_NAME]
+    assert _installed_commands(data)[STOP_EVENT] == [STOP_COMMAND]
 
 
 def test_install_hook_is_idempotent(tmp_path: Path) -> None:
@@ -60,7 +71,10 @@ def test_install_hook_is_idempotent(tmp_path: Path) -> None:
     assert second is False  # no-op, already present
 
     data = json.loads(settings_path.read_text(encoding="utf-8"))
-    assert _all_commands(data) == [HOOK_COMMAND_NAME]  # not duplicated
+    assert _installed_commands(data) == {
+        HOOK_EVENT_NAME: [HOOK_COMMAND_NAME],
+        STOP_EVENT: [STOP_COMMAND],
+    }  # not duplicated
 
 
 def test_install_hook_uses_custom_command_string(tmp_path: Path) -> None:

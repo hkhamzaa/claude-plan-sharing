@@ -507,3 +507,61 @@ def test_list_active_grants_after_approval(client: TestClient, pool_and_tokens: 
     r = client.get(f"/members/{bob['id']}/capacity/grants", headers=bob_headers)
     assert r.status_code == 200
     assert len(r.json()["received"]) == 1
+
+
+# --- Milestone 10: pool overview batch endpoint --------------------------------
+
+
+def test_pool_overview_requires_auth(client: TestClient, pool_and_tokens: dict) -> None:
+    r = client.get(f"/pools/{pool_and_tokens['pool_id']}/overview")
+    assert r.status_code == 401
+
+
+def test_pool_overview_rejects_device_not_in_pool(client: TestClient, pool_and_tokens: dict) -> None:
+    other = _create_pool(client, "Other Pool", ["Carol"])
+    carol = other["members"][0]
+    carol_token, _ = _register_device(client, carol["user_id"], "Carol's Laptop")
+
+    r = client.get(f"/pools/{pool_and_tokens['pool_id']}/overview", headers=_auth(carol_token))
+    assert r.status_code == 403
+
+
+def test_pool_overview_single_member(client: TestClient) -> None:
+    created = _create_pool(client, "Solo Pool", ["Solo"])
+    solo = created["members"][0]
+    token, _ = _register_device(client, solo["user_id"], "Solo Device")
+
+    r = client.get(f"/pools/{created['pool']['id']}/overview", headers=_auth(token))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["pool_id"] == created["pool"]["id"]
+    assert len(body["members"]) == 1
+    assert body["members"][0]["member"]["display_name"] == "Solo"
+
+
+def test_pool_overview_matches_per_member_endpoints(client: TestClient, pool_and_tokens: dict) -> None:
+    pool_id = pool_and_tokens["pool_id"]
+    r = client.get(f"/pools/{pool_id}/overview", headers=_auth(pool_and_tokens["alice_token"]))
+    assert r.status_code == 200
+    overview_by_id = {row["member"]["id"]: row for row in r.json()["members"]}
+    assert set(overview_by_id) == {pool_and_tokens["alice"]["id"], pool_and_tokens["bob"]["id"]}
+
+    for name in ("alice", "bob"):
+        member = pool_and_tokens[name]
+        token = pool_and_tokens[f"{name}_token"]
+        status = client.get(f"/members/{member['id']}/status", headers=_auth(token)).json()
+        cap_five = client.get(
+            f"/members/{member['id']}/capacity",
+            params={"window": "five_hour"},
+            headers=_auth(token),
+        ).json()
+        cap_week = client.get(
+            f"/members/{member['id']}/capacity",
+            params={"window": "weekly"},
+            headers=_auth(token),
+        ).json()
+
+        row = overview_by_id[member["id"]]
+        assert row["status"] == status
+        assert row["capacity"]["five_hour"] == cap_five
+        assert row["capacity"]["weekly"] == cap_week

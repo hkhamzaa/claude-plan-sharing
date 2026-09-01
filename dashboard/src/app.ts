@@ -156,7 +156,7 @@ async function renderPoolOverview(): Promise<void> {
   const rows = await loadPoolOverview(config, myStatus.pool_id);
   $("view-pool").innerHTML = `
     <h2>Pool overview</h2>
-    <p class="hint">One members-list call plus status + capacity per member (fan-out).</p>
+    <p class="hint">Fetched in one batch overview call.</p>
     ${renderPoolTable(rows)}
   `;
 }

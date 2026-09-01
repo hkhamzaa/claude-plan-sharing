@@ -25,6 +25,7 @@ dev = ["pytest>=8.0", "claude-share[server]", "claude-share[client]"]
 [project.scripts]
 claude-share = "claude_share.cli.main:main"
 claude-share-hook = "claude_share.integrations.claude_code.hook:main"
+claude-share-stop-hook = "claude_share.integrations.claude_code.stop_hook:main"
 claude-share-server = "claude_share.server.main:run"
 
 [tool.hatch.build.targets.wheel]

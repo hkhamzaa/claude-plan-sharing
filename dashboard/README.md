@@ -8,7 +8,7 @@ calls an existing endpoint.
 ## What it shows
 
 1. **My status** — usage, guaranteed/potential capacity, reset times for both windows
-2. **Pool overview** — all members side by side (fan-out of status/capacity calls)
+2. **Pool overview** — all members side by side (one batch `GET /pools/{id}/overview` call)
 3. **Pending requests** — incoming requests needing your approval
 4. **Active grants** — sent and received SOLID/SHARED grants, with revoke on sent grants
 
@@ -68,8 +68,9 @@ Vitest covers client-side **display formatting only** (durations, dates, labels)
 
 If a number is not present in an API response field, the dashboard does not
 compute it. Guaranteed, potential, remaining, and grant figures all come from
-`GET /members/{id}/status`, `GET /members/{id}/capacity`, and the Milestone 7
-read endpoints documented in `docs/architecture.md`.
+`GET /members/{id}/status`, `GET /members/{id}/capacity`, `GET /pools/{id}/overview`
+(for the pool table), and the Milestone 7 read endpoints documented in
+`docs/architecture.md`.
 
 ## Not included
 

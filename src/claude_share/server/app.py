@@ -37,7 +37,7 @@ def create_app(uow_factory: Callable[[], UnitOfWork]) -> FastAPI:
         description=(
             "Milestone 5: HTTP adapter over the same QuotaService/CapacityService/"
             "AgentService application logic the local CLI uses - see docs/architecture.md. "
-            "Run behind TLS; see README.md for deployment notes."
+            "Run behind a private network (Tailscale); see docs/TAILSCALE_SETUP.md."
         ),
     )
     app.state.uow_factory = uow_factory

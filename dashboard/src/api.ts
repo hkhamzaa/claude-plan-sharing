@@ -116,14 +116,35 @@ export interface MemberPoolRow {
   capacityWeekly: EffectiveCapacity;
 }
 
+export interface MemberPoolOverviewResponse {
+  member: MemberSummary;
+  status: MemberStatus;
+  capacity: Record<string, EffectiveCapacity>;
+}
+
+export interface PoolOverviewResponse {
+  pool_id: string;
+  members: MemberPoolOverviewResponse[];
+}
+
+export function mapPoolOverviewRow(row: MemberPoolOverviewResponse): MemberPoolRow {
+  const capacityFiveHour = row.capacity.five_hour;
+  const capacityWeekly = row.capacity.weekly;
+  if (!capacityFiveHour || !capacityWeekly) {
+    throw new Error("Pool overview response missing capacity for a window.");
+  }
+  return {
+    member: row.member,
+    status: row.status,
+    capacityFiveHour,
+    capacityWeekly,
+  };
+}
+
 export async function loadPoolOverview(config: DashboardConfig, poolId: string): Promise<MemberPoolRow[]> {
-  const members = await listPoolMembers(config, poolId);
-  return Promise.all(
-    members.map(async (member) => ({
-      member,
-      status: await getMemberStatus(config, member.id),
-      capacityFiveHour: await getMemberCapacity(config, member.id, "five_hour"),
-      capacityWeekly: await getMemberCapacity(config, member.id, "weekly"),
-    })),
+  const overview = await apiFetch<PoolOverviewResponse>(
+    config,
+    `/pools/${encodeURIComponent(poolId)}/overview`,
   );
+  return overview.members.map(mapPoolOverviewRow);
 }

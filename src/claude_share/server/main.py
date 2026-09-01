@@ -7,10 +7,9 @@ real Postgres deployment target - everything above it (`app.py`,
 `routes.py`) is backend-agnostic via `uow_factory`, and everything below it
 (`infrastructure/postgres/`) is transport-agnostic.
 
-Does **not** terminate TLS. Run this behind a reverse proxy (nginx, Caddy,
-an ALB, ...) for any real deployment - see docs/architecture.md and
-README.md, "Transport security", for why that isn't optional: bearer
-tokens and quota data would otherwise cross the network in cleartext.
+Does **not** terminate TLS. For this project's deployment, run on a
+private Tailscale tailnet (see docs/TAILSCALE_SETUP.md) so bearer tokens
+and quota data are not exposed on the public internet in cleartext.
 """
 
 from __future__ import annotations

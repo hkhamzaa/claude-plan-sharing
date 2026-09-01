@@ -71,7 +71,7 @@ def test_hook_below_warning_threshold_exits_0_with_warning_on_stdout(
     save_local_identity(config_path, _make_identity(pool.id, alice.id, alice.user_id))
 
     # Leave 800/5000 = 16% remaining, below the 20% warning threshold, but
-    # still enough to cover the placeholder per-prompt cost.
+    # still has remaining capacity.
     service.consume(alice.id, WindowType.FIVE_HOUR, 4200, "warn-setup")
 
     exit_code, out, err = _run_hook(monkeypatch, config_path, db_path, capsys)

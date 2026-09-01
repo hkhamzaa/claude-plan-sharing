@@ -211,6 +211,17 @@ class MemberGrantsOut(BaseModel):
     received: list[CapacityGrantOut]
 
 
+class MemberPoolOverviewOut(BaseModel):
+    member: MemberOut
+    status: MemberStatusOut
+    capacity: dict[WindowType, EffectiveCapacityOut]
+
+
+class PoolOverviewOut(BaseModel):
+    pool_id: str
+    members: list[MemberPoolOverviewOut]
+
+
 # --- dataclass -> schema converters ------------------------------------------
 
 

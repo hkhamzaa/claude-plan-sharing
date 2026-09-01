@@ -218,17 +218,18 @@ claude-share hook install [--project | --user]
 claude-share hook uninstall [--project | --user]
 ```
 
-Installs (or removes) a `UserPromptSubmit` hook in Claude Code's
-settings.json - `--project` targets `./.claude/settings.json` (the
-default; good for a shared, git-committed setup), `--user` targets
-`~/.claude/settings.json` (this machine only). Both commands merge into
-whatever is already there: other hooks and settings are left untouched,
-and running `install` twice never creates a duplicate entry.
+Installs (or removes) **two** Claude Code hooks in settings.json — a
+`UserPromptSubmit` pre-check and a `Stop` post-turn metering hook.
+`--project` targets `./.claude/settings.json` (the default; good for a
+shared, git-committed setup), `--user` targets `~/.claude/settings.json`
+(this machine only). Both commands merge into whatever is already there:
+other hooks and settings are left untouched, and running `install` twice
+never creates duplicate entries.
 
-Before each prompt, the hook checks the joined identity's guaranteed
-FIVE_HOUR quota: sufficient and not running low → silent; running low →
-allowed through with a short warning; exhausted → the prompt is blocked
-with a message like:
+**Before each prompt** (`UserPromptSubmit` → `claude-share-hook`): checks
+whether the joined identity has any guaranteed FIVE_HOUR capacity
+remaining. No capacity → prompt blocked; running low → allowed with a
+warning; otherwise silent:
 
 ```
 Claude Share
@@ -237,13 +238,18 @@ Used: 25.0% / 25%
 Reset: 1h 32m
 ```
 
-A machine with no `login`/`join` configured is completely unaffected -
-the hook is strictly opt-in. See
-[docs/architecture.md](docs/architecture.md) for the exact mechanism
-(verified against Claude Code's hooks documentation), the fail-open error
-policy, and why this checks *availability* rather than metering real
-usage (there's no token-cost estimator yet - it's a fixed placeholder
-cost per prompt, not real Claude usage).
+**After each turn** (`Stop` → `claude-share-stop-hook`): reads Claude
+Code's reported input/output token counts from the session transcript,
+converts them to abstract quota units, and calls `consume()`. Failures
+to read token data consume zero units (fail-open) — never a guessed
+fallback.
+
+A machine with no `login`/`join` configured is completely unaffected —
+both hooks are strictly opt-in. See
+[docs/architecture.md](docs/architecture.md) for the two-hook design,
+the verified token data source, the weighting formula, idempotency, and
+the honest caveat that this is measured token-count metering from Claude
+Code, not Anthropic's internal billing ledger.
 
 **End-to-end setup, from zero:**
 
@@ -258,7 +264,7 @@ claude-share join  --pool pool-id --member alice-id
 
 cd /path/to/some/project   # wherever you use Claude Code
 claude-share hook install --project
-# -> Installed the Claude Share UserPromptSubmit hook into .../.claude/settings.json.
+# -> Installed the Claude Share UserPromptSubmit and Stop hooks into .../.claude/settings.json.
 ```
 
 From here, every prompt submitted in that project through Claude Code (or
@@ -272,12 +278,15 @@ action needed.
 devices can share one authoritative copy of pool/quota/capacity state over
 HTTP instead of each keeping an independent local SQLite database.
 
-> **Run this behind TLS for any real deployment.** Bearer tokens and quota
-> data are sent as plain HTTP request/response bodies; over anything but a
-> fully private network path, that's as sniffable as a plaintext password.
-> `claude-share-server` does **not** terminate TLS itself — put a reverse
-> proxy (nginx, Caddy, an ALB, a managed ingress, ...) in front of it. See
-> [docs/architecture.md](docs/architecture.md) for the full reasoning.
+> **Do not expose this server on the public internet in cleartext.** Bearer
+> tokens and quota data travel in HTTP bodies; a public `http://<ip>:8001`
+> deployment is unsafe. `claude-share-server` does **not** terminate TLS
+> itself. For this project's deployment, use **Tailscale** so only trusted
+> devices on your tailnet can reach the server (encrypted mesh, no public
+> port required). Follow **[docs/TAILSCALE_SETUP.md](docs/TAILSCALE_SETUP.md)**
+> end to end — install on the Oracle Cloud server and each Windows client,
+> point `--server`/extension/dashboard URLs at the Tailscale address, then
+> close the public Security List / iptables rule for port 8001.
 
 ### 1. Set up Postgres
 
@@ -312,7 +321,7 @@ an identity yet — `--server` is a global flag (like `--db`/`--config`) and
 must come before the subcommand:
 
 ```bash
-claude-share --server https://claude-share.example.com \
+claude-share --server http://100.x.y.z:8001 \
     pool create --name "Family Plan" --members "Alice,Bob"
 # -> Alice: member_id=... user_id=...
 # -> Bob:   member_id=... user_id=...
@@ -326,7 +335,7 @@ subcommands, same flags, same output shapes — just talking HTTP instead of
 opening a local database file:
 
 ```bash
-claude-share --config alice.json login --server https://claude-share.example.com \
+claude-share --config alice.json login --server http://100.x.y.z:8001 \
     --user-id <alice_user_id> --device-name "Alice's Laptop"
 claude-share --config alice.json join --pool <pool_id> --member <alice_member_id>
 
@@ -342,6 +351,11 @@ using local SQLite with zero server involvement. A machine can be pointed
 at local SQLite *or* a server, never both at once, per `--config` file
 (one `LocalIdentity` = one mode) — use separate `--config` paths to run
 both modes side by side on the same machine.
+
+**Deploying on a real server?** See
+[docs/TAILSCALE_SETUP.md](docs/TAILSCALE_SETUP.md) for Tailscale setup
+(server + Windows clients), migrating off a public IP, and closing public
+port exposure.
 
 ### Auth model, briefly
 

@@ -1,14 +1,13 @@
-"""Install/uninstall the Claude Share hook in a Claude Code settings.json.
+"""Install/uninstall the Claude Share hooks in a Claude Code settings.json.
 
 Handles merging into an existing settings.json (preserving unrelated keys
 and other hooks) and is idempotent: running `install_hook` twice never
 produces duplicate entries, and `uninstall_hook` only ever removes the
-entry it is looking for.
+entries it owns.
 
-Kept separate from `hook.py` (which is the fast, standalone, frequently
-re-invoked hook process) since this module is only ever used by the
-`claude-share hook install/uninstall` CLI commands - a completely
-different runtime path with no latency budget to worry about.
+Kept separate from `hook.py`/`stop_hook.py` (which are fast, standalone,
+frequently re-invoked hook processes) since this module is only ever used
+by the `claude-share hook install/uninstall` CLI commands.
 """
 
 from __future__ import annotations
@@ -16,16 +15,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-#: The Claude Code hook event this integration registers against. See
-#: hook.py's module docstring for the verified UserPromptSubmit contract.
-HOOK_EVENT_NAME = "UserPromptSubmit"
+#: Pre-prompt availability check (Milestone 4, updated Milestone 8).
+USER_PROMPT_SUBMIT_EVENT = "UserPromptSubmit"
+USER_PROMPT_SUBMIT_COMMAND = "claude-share-hook"
 
-#: The console-script name installed by this package (see pyproject.toml
-#: [project.scripts]). Written into settings.json as a bare command name,
-#: not a hardcoded absolute path, so the same settings.json works on any
-#: machine that has claude-share installed (resolved via PATH at hook
-#: invocation time, same as any other shell command).
-HOOK_COMMAND_NAME = "claude-share-hook"
+#: Post-turn token metering (Milestone 8).
+STOP_EVENT = "Stop"
+STOP_COMMAND = "claude-share-stop-hook"
+
+#: Backward-compatible aliases used by existing tests/imports.
+HOOK_EVENT_NAME = USER_PROMPT_SUBMIT_EVENT
+HOOK_COMMAND_NAME = USER_PROMPT_SUBMIT_COMMAND
+STOP_HOOK_EVENT_NAME = STOP_EVENT
+STOP_HOOK_COMMAND_NAME = STOP_COMMAND
+
+#: Every hook this integration registers. Order is stable for tests/docs.
+HOOK_INSTALLATIONS: tuple[tuple[str, str], ...] = (
+    (USER_PROMPT_SUBMIT_EVENT, USER_PROMPT_SUBMIT_COMMAND),
+    (STOP_EVENT, STOP_COMMAND),
+)
 
 
 def _load_settings(settings_path: Path) -> dict:
@@ -50,42 +58,23 @@ def _has_entry(event_list: list, command: str) -> bool:
     return False
 
 
-def install_hook(settings_path: str | Path, command: str = HOOK_COMMAND_NAME) -> bool:
-    """Add a UserPromptSubmit hook entry pointing at `command`.
-
-    Merges into any existing settings.json, preserving every other key and
-    every other hook untouched. Returns False (no write performed) if an
-    entry for `command` is already present - idempotent.
-    """
-    settings_path = Path(settings_path)
-    settings = _load_settings(settings_path)
-
+def _install_hook_event(settings: dict, event_name: str, command: str) -> bool:
     hooks = settings.setdefault("hooks", {})
-    event_list = hooks.setdefault(HOOK_EVENT_NAME, [])
+    event_list = hooks.setdefault(event_name, [])
 
     if _has_entry(event_list, command):
         return False
 
     event_list.append({"hooks": [{"type": "command", "command": command}]})
-    _save_settings(settings_path, settings)
     return True
 
 
-def uninstall_hook(settings_path: str | Path, command: str = HOOK_COMMAND_NAME) -> bool:
-    """Remove only the `command` entry from the UserPromptSubmit hook list.
-
-    Leaves any other configured hooks (for this event or any other) and
-    any other settings.json keys completely intact. Returns False (no
-    write performed) if no matching entry was found.
-    """
-    settings_path = Path(settings_path)
-    settings = _load_settings(settings_path)
-
+def _uninstall_hook_event(settings: dict, event_name: str, command: str) -> bool:
     hooks = settings.get("hooks")
-    if not isinstance(hooks, dict) or HOOK_EVENT_NAME not in hooks:
+    if not isinstance(hooks, dict) or event_name not in hooks:
         return False
 
-    event_list = hooks[HOOK_EVENT_NAME]
+    event_list = hooks[event_name]
     if not isinstance(event_list, list):
         return False
 
@@ -98,25 +87,77 @@ def uninstall_hook(settings_path: str | Path, command: str = HOOK_COMMAND_NAME) 
             removed = True
 
         if kept or "hooks" not in group:
-            # Keep the group if it still has other hooks, or if it never
-            # had a "hooks" key at all (leave whatever we don't understand
-            # untouched rather than dropping it).
             new_group = dict(group)
             if "hooks" in group:
                 new_group["hooks"] = kept
             new_event_list.append(new_group)
-        # else: the group's hooks became empty solely because we removed
-        # our own entry from it - drop the now-pointless group entirely.
 
     if not removed:
         return False
 
     if new_event_list:
-        hooks[HOOK_EVENT_NAME] = new_event_list
+        hooks[event_name] = new_event_list
     else:
-        del hooks[HOOK_EVENT_NAME]
+        del hooks[event_name]
     if not hooks:
         del settings["hooks"]
+
+    return True
+
+
+def install_hook(settings_path: str | Path, command: str | None = None) -> bool:
+    """Add Claude Share hook entries into `settings_path`.
+
+    When `command` is None (the normal CLI path), installs both the
+    UserPromptSubmit pre-check and the Stop post-consume hooks. When
+    `command` is provided, only that single command is installed into
+    UserPromptSubmit (legacy test helper behavior).
+
+    Merges into any existing settings.json, preserving every other key and
+    every other hook untouched. Returns False (no write performed) if every
+    requested entry is already present — idempotent.
+    """
+    settings_path = Path(settings_path)
+    settings = _load_settings(settings_path)
+
+    if command is not None:
+        installed = _install_hook_event(settings, USER_PROMPT_SUBMIT_EVENT, command)
+    else:
+        installed = False
+        for event_name, hook_command in HOOK_INSTALLATIONS:
+            if _install_hook_event(settings, event_name, hook_command):
+                installed = True
+
+    if not installed:
+        return False
+
+    _save_settings(settings_path, settings)
+    return True
+
+
+def uninstall_hook(settings_path: str | Path, command: str | None = None) -> bool:
+    """Remove Claude Share hook entries from `settings_path`.
+
+    When `command` is None, removes both UserPromptSubmit and Stop entries
+    owned by this integration. When `command` is provided, removes only
+    that command from UserPromptSubmit (legacy test helper behavior).
+
+    Leaves any other configured hooks and settings.json keys intact. Returns
+    False if no matching entry was found.
+    """
+    settings_path = Path(settings_path)
+    settings = _load_settings(settings_path)
+
+    if command is not None:
+        removed = _uninstall_hook_event(settings, USER_PROMPT_SUBMIT_EVENT, command)
+    else:
+        removed = False
+        for event_name, hook_command in HOOK_INSTALLATIONS:
+            if _uninstall_hook_event(settings, event_name, hook_command):
+                removed = True
+
+    if not removed:
+        return False
 
     _save_settings(settings_path, settings)
     return True
