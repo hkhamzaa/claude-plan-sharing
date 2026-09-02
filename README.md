@@ -3,6 +3,9 @@
 A quota-management and fair-sharing system for a trusted group of people who
 share one underlying Claude subscription.
 
+**Deploying for a group?** See **[SETUP.md](SETUP.md)** for the full server,
+pool, CLI, Claude Code hook, extension, and dashboard walkthrough.
+
 **Milestones 1-5 are implemented.** Milestone 1 is the local quota
 engine: it divides 100% of a pool's logical quota equally among its
 members and tracks consumption against two independent windows (a
